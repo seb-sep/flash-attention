@@ -13,9 +13,9 @@
 // Is this referring to Br and Bc? Maybe this is kBlockM, N in the cuda code
 // https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/src/flash_fwd_kernel.h
 // FIXME: currently doesn't work when too many threads for the matmuls, figure out better allocation of threads
-const size_t N_WARPS = 1;
-const size_t Bc = 4;
-const size_t Br = 4;
+const size_t N_WARPS = 4;
+const size_t Bc = 32;
+const size_t Br = 32;
 
 __device__
 void tensorprint(const float* data, const size_t rows, const size_t cols) {
@@ -271,7 +271,6 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 
     // // size and num of Q, O tiles
     size_t tr = ceil(N / Br);
-    // std::cout << tr << tc << '\n';
 
     // instantiate extra tensors
     auto options = torch::TensorOptions().device(Q.device()).dtype(Q.dtype()); 
@@ -288,14 +287,22 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     // shared for K, V, Q, O, m, l
     size_t smem_size = sizeof(float) * (2*kv_size + 2*qo_size + p_size + 2*Br);
 
+    std::cout << "Launching kernel with smem size" << smem_size << "\n";
+
     // want flat thread grid
-    flash_attention_kernel<<<tr, N_WARPS*32, smem_size>>>(
+    flash_attention_kernel<<<tr, 32, smem_size>>>(
         (float*)Q.const_data_ptr(), (float*)K.const_data_ptr(), (float*)V.const_data_ptr(), 
         (float*)O.mutable_data_ptr(), (float*)m.mutable_data_ptr(), (float*)l.mutable_data_ptr(),
         N, d, tc);
 
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        printf("Error running kernel: %s\n", hipGetErrorString(err));
+    }
+
     return O;
 }
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
