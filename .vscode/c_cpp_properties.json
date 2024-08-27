@@ -1,11 +1,12 @@
 {
     "configurations": [
         {
-            "name": "cuda",
+            "name": "cuda/hip",
             "includePath": [
                 "${workspaceFolder}/**",
                 "~/Code/pyenvs/cudaenv/lib/python3.12/site-packages/torch/include/**",
-                "~/miniconda3/include/python3.12/**"
+                "~/miniconda3/include/python3.12/**",
+                "/opt/rocm-6.1.3/include/**",
             ],
             "intelliSenseMode": "linux-gcc-x64",
             "compilerPath": "/usr/bin/gcc",
