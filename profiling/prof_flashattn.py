@@ -21,5 +21,6 @@ Q = torch.randint(1, 9, (4, 2), device='cuda').float()
 K = torch.randint(1, 9, (4, 2), device='cuda').float()
 V = torch.randint(1, 9, (4, 2), device='cuda').float()
 
-module.flash_attn(Q, K, V)
+for _ in range(100):
+    module.flash_attn(Q, K, V)
 # F.scaled_dot_product_attention(Q, K, V, scale=1)
