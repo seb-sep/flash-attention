@@ -83,7 +83,7 @@ half max(half a, half b) { return __hgt(a, b) ? a : b; }
 
 
 __global__
-void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O, half* m, half* l, size_t N, size_t d, size_t tc) {
+void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O, half scale, size_t N, size_t d, size_t tc) {
 
 
     /*
@@ -145,7 +145,8 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // index for a VECTOR of Q
         if (idx < N) {
             for (int k=0; k<d; ++k) {
-                Q_s[idx*d + k] = Q[idx*d + k];
+                // apply scaling factor here instead of after QK^T; this prevents matmul from overflowing
+                Q_s[idx*d + k] = __hmul(Q[idx*d + k], scale);
                 O_s[idx*d + k] = H_ZERO; //O[(j*Br + idx)*d + k];
             }
         } else {
@@ -337,8 +338,6 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     // instantiate extra tensors
     auto options = torch::TensorOptions().device(Q.device()).dtype(Q.dtype()); 
     torch::Tensor O = torch::zeros_like(Q);
-    torch::Tensor m = torch::full({int(N),}, -INFINITY, options);
-    torch::Tensor l = torch::zeros_like(m);
 
     // each thread block loads a SINGLE Q tile, iterates over all respective KV, so it only cares
     // abt size of Q tile, so use tr for num thread blocks
@@ -350,6 +349,9 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     // don't allocate shared for m and l now
     size_t smem_size = sizeof(half) * (2*kv_size + 2*qo_size + p_size);
 
+    half scaling_factor = __float2half(1 / sqrt(d));
+    std::cout << "scaling QK^T by " << __half2float(scaling_factor) << "\n";
+
     std::cout << "Launching kernel with smem size " << smem_size << "\n";
 
     std::cout << std::flush;
@@ -359,8 +361,7 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
         // want flat thread grid
         flash_attention_kernel<<<tr, 32*N_WARPS, smem_size>>>(
             (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
-            (half*)O.mutable_data_ptr(), (half*)m.mutable_data_ptr(), (half*)l.mutable_data_ptr(),
-            N, d, tc);
+            (half*)O.mutable_data_ptr(), scaling_factor, N, d, tc);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
