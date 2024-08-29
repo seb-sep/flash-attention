@@ -25,12 +25,12 @@ const size_t N_WARPS = Br / 32 + (Br%32!=0);
 
 
 __device__
-void tensorprint(float* data, const size_t rows, const size_t cols) {
+void tensorprint(half* data, const size_t rows, const size_t cols) {
     printf("[");
     for (int i=0; i<rows; ++i) {
         printf("[");
         for (int j=0; j<cols; ++j) {
-            printf("%.4f, ", (data[i*cols + j]));
+            printf("%.4f, ", __half2float(data[i*cols + j]));
         }
         printf("]");
         if (i<rows-1)
@@ -45,7 +45,7 @@ void tensorprint(float* data, const size_t rows, const size_t cols) {
 // adds results of A @ B to res
 // FIXME: do your m and l vectors need to be mixed precision? also revisit whether you need them in global
 __device__
-void shared_matmul(float* A, float* B, float* res, size_t m, size_t k, size_t n, bool add=true) {
+void shared_matmul(half* A, half* B, half* res, size_t m, size_t k, size_t n, bool add=true) {
     // need some scheme to evenly divide output values among input threads
     // we can be pretty naive about how to do this because we're in shared mem
 
@@ -62,7 +62,7 @@ void shared_matmul(float* A, float* B, float* res, size_t m, size_t k, size_t n,
         // so, calculate output value for i and j
         for (int q=0; q<k; ++q)
             // sum += __half2float(__hmul(A[i*k + q], B[n*q + j]));
-            sum += (A[i*k + q]) * (B[n*q + j]);
+            sum += __half2float(A[i*k + q]) * __half2float(B[n*q + j]);
 
         // half hsum = __float2half(sum);
         
@@ -70,9 +70,9 @@ void shared_matmul(float* A, float* B, float* res, size_t m, size_t k, size_t n,
         // need another chunk of shared memory
         // the optionality prevents us from having to otherwise zero out a matrix first when we don't want to add
         if (add) {
-            res[i*n + j] = ((res[i*n + j]) + sum);
+            res[i*n + j] = __float2half(__half2float(res[i*n + j]) + sum);
         } else {
-            res[i*n + j] = (sum);
+            res[i*n + j] = __float2half(sum);
         }
     }
 
@@ -107,24 +107,25 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     */ 
         
     const half H_ZERO = __float2half(0);
+    const half H_NINF = __float2half(-INFINITY);
     
     // now that Bc and Br are statically known, can do statically allocated sram
     // dynamically allocate shared memory, because we don't know 
     // what our tile sizes will be until runtime (d is dynamic)
-    extern __shared__ float sram[];
+    extern __shared__ half sram[];
 
     // // total size of shared k and v is num of vecs in tile * size of vec
     size_t kv_size = Bc * d;
-    float *K_s = sram;
-    float *V_s = sram + kv_size;
+    half *K_s = sram;
+    half *V_s = sram + kv_size;
 
     size_t qo_size = Br * d;
-    float *Q_s = V_s + kv_size;
-    float *O_s = Q_s + qo_size;
+    half *Q_s = V_s + kv_size;
+    half *O_s = Q_s + qo_size;
 
     // {Brxd} @ {dxBc} = {BrxBc}
     size_t p_size = Br * Bc;
-    float *P_s = O_s + qo_size;
+    half *P_s = O_s + qo_size;
 
     // half* m_s = P_s + p_size;
     // // should be br, because we need Br values of m and l in each shared block
@@ -147,26 +148,26 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         if (idx < N) {
             for (int k=0; k<d; ++k) {
                 // apply scaling factor here instead of after QK^T; this prevents matmul from overflowing
-                Q_s[threadIdx.x*d + k] = (__half2float(Q[idx*d + k]));
-                O_s[threadIdx.x*d + k] = 0;//H_ZERO; //O[(j*Br + idx)*d + k];
+                Q_s[threadIdx.x*d + k] = (Q[idx*d + k]);
+                O_s[threadIdx.x*d + k] = H_ZERO; //O[(j*Br + idx)*d + k];
             }
         } else {
             for (int k=0; k<d; ++k) {
-                Q_s[threadIdx.x*d + k] = -INFINITY;//H_ZERO;
-                O_s[threadIdx.x*d + k] = 0;//H_ZERO;
+                Q_s[threadIdx.x*d + k] = H_NINF;
+                O_s[threadIdx.x*d + k] = H_ZERO;
             }
         }
     }
 
     // save the syncthreads for later
 
-    if (threadIdx.x == 0 && blockIdx.x == 1) {
-        printf("Q:\n");
-        tensorprint(Q_s, Br, d);
+    // if (threadIdx.x == 0 && blockIdx.x == 1) {
+    //     printf("Q:\n");
+    //     tensorprint(Q_s, Br, d);
         // tensorprint(O_s, Br, d);
         // tensorprint(m_s, 1, Br);
         // tensorprint(l_s, 1, Br);
-    }
+    // }
 
     int r = blockDim.x / Bc;
     // loop over kv tiles
@@ -180,13 +181,13 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
                     // need to load K transposed; load column into K_s
                     // K_s has rows of len Bc and cols of len d
                     // FIXME: QV reads not coalesced at all
-                    K_s[Bc*k + threadIdx.x] = __half2float(K[idx*d + k]);
-                    V_s[threadIdx.x*d + k] = __half2float(V[idx*d + k]);
+                    K_s[Bc*k + threadIdx.x] = K[idx*d + k];
+                    V_s[threadIdx.x*d + k] = V[idx*d + k];
                 }
             } else {
                 for (int k=0; k<d; ++k) {
-                    K_s[Bc*k + threadIdx.x] = -INFINITY;//H_ZERO;
-                    V_s[threadIdx.x*d + k] = 0;//H_ZERO;
+                    K_s[Bc*k + threadIdx.x] = H_NINF;
+                    V_s[threadIdx.x*d + k] = H_ZERO;
                 }
             }
         }
@@ -214,16 +215,15 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         if (threadIdx.x < Br) {
 
             // calculate max over a single row of P_s
-            // half mt_h = __float2half(-INFINITY);
-            float mt = -INFINITY;
+            half mt_h = H_NINF;
             for (int i=0; i<Bc; ++i)
-                mt = max(mt, P_s[threadIdx.x*Bc + i]);
-            // float mt = __half2float(mt_h);
+                mt_h = max(mt_h, P_s[threadIdx.x*Bc + i]);
+            float mt = __half2float(mt_h);
             // shifted exponentiation of each row and row-wise sumexp
             float lt = 0;
             for (int i=0; i<Bc; ++i) {
-                float exp = __expf((P_s[threadIdx.x*Bc + i]) - mt);
-                P_s[threadIdx.x*Bc + i] = (exp);
+                float exp = __expf(__half2float(P_s[threadIdx.x*Bc + i]) - mt);
+                P_s[threadIdx.x*Bc + i] = __float2half(exp);
                 lt += exp;
             }
             // if (threadIdx.x == 0 && blockIdx.x == 1) {
@@ -252,7 +252,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
             //     tensorprint(O_s, Br, d);
             // }
             for (int i=0; i<d; ++i)
-                O_s[threadIdx.x*d + i] = ((O_s[threadIdx.x*d + i]) * old_lse);
+                O_s[threadIdx.x*d + i] = __float2half(__half2float(O_s[threadIdx.x*d + i]) * old_lse);
             
             // only necessary for now
             // __syncthreads();
@@ -264,7 +264,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
             // scale P's rows by exp(mt - m_new) as in flashattn
             // half undo_exp_h = __float2half(undo_exp);
             for (int i=0; i<Bc; ++i)
-                P_s[threadIdx.x*Bc+i] = ((P_s[threadIdx.x*Bc+i]) * undo_exp);
+                P_s[threadIdx.x*Bc+i] = __float2half(__half2float(P_s[threadIdx.x*Bc+i]) * undo_exp);
             
             // printf("multiplied by %f\n", __expf(mt - m_new));
             // load softmax statistics back to shared memory as the 'old' values
@@ -295,7 +295,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
             float dividend = __fdividef(1, l_new);
             // printf("l_new is %f, dividend is %f\n", l_new, dividend);
             for (int i=0; i<d; ++i)
-                O_s[threadIdx.x*d + i] = ((O_s[threadIdx.x*d + i]) * dividend);
+                O_s[threadIdx.x*d + i] = __float2half(__half2float(O_s[threadIdx.x*d + i]) * dividend);
         }
             
         // if (threadIdx.x == 0 && blockIdx.x == 1) {
@@ -313,7 +313,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     if (threadIdx.x < Br && idx < N) {
         for (int k=0; k<d; ++k) {
             // printf("Writing %f back to dimension %d of output token %d\n", O_s[idx*d + k], k, idx);
-            O[idx*d + k] = __float2half(O_s[threadIdx.x*d + k]);
+            O[idx*d + k] = O_s[threadIdx.x*d + k];
         }
         // don't worry about saving softmax statistics for now
 
@@ -372,7 +372,7 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     size_t p_size = Br * Bc;
     // shared for K, V, Q, O, m, l
     // don't allocate shared for m and l now
-    size_t smem_size = sizeof(float) * (2*kv_size + 2*qo_size + p_size);
+    size_t smem_size = sizeof(half) * (2*kv_size + 2*qo_size + p_size);
 
     float scaling_factor = (1 / sqrt(d));
     // std::cout << "scaling QK^T by " << (scaling_factor) << "\n";
