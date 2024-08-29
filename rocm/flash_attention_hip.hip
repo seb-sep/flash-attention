@@ -1,6 +1,9 @@
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
 #include <torch/types.h>
 #include <torch/extension.h>
+
 #include <stdio.h>
 #include <iostream>
 #include <utility>
@@ -13,17 +16,21 @@
 // Is this referring to Br and Bc? Maybe this is kBlockM, N in the cuda code
 // https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/src/flash_fwd_kernel.h
 // FIXME: currently doesn't work when too many threads for the matmuls, figure out better allocation of threads
-const size_t N_WARPS = 4;
-const size_t Bc = 32;
-const size_t Br = 32;
+// because of sram limitations, I can't afford the same block sizes and thus I should probably allocate less warps per block
+// Br should always be at least 32, since many parts of the kernel are row-wise over tiles of height Br
+// Furthermore, as long as things are threadwise over Br, Br should always be larger than Bc and generally as large as possible
+const size_t Br = 8;
+const size_t Bc = 8;
+const size_t N_WARPS = Br / 32 + (Br%32!=0);
+
 
 __device__
-void tensorprint(const float* data, const size_t rows, const size_t cols) {
+void tensorprint(half* data, const size_t rows, const size_t cols) {
     printf("[");
     for (int i=0; i<rows; ++i) {
         printf("[");
         for (int j=0; j<cols; ++j) {
-            printf("%.4f, ", data[i*cols + j]);
+            printf("%.6f, ", __half2float(data[i*cols + j]));
         }
         printf("]");
         if (i<rows-1)
@@ -36,8 +43,9 @@ void tensorprint(const float* data, const size_t rows, const size_t cols) {
 // not gonna have one thread per output value: a 128x128 matrix has 16384 floats in it
 // assume all threads invoke this function
 // adds results of A @ B to res
+// FIXME: do your m and l vectors need to be mixed precision? also revisit whether you need them in global
 __device__
-void shared_matmul(const float* A, const float* B, float* res, size_t m, size_t k, size_t n, bool add=true) {
+void shared_matmul(half* A, half* B, half* res, size_t m, size_t k, size_t n, bool add=true) {
     // need some scheme to evenly divide output values among input threads
     // we can be pretty naive about how to do this because we're in shared mem
 
@@ -53,24 +61,29 @@ void shared_matmul(const float* A, const float* B, float* res, size_t m, size_t 
         float sum = 0;
         // so, calculate output value for i and j
         for (int q=0; q<k; ++q)
-            sum += A[i*k + q] * B[n*q + j];
+            sum += __half2float(__hmul(A[i*k + q], B[n*q + j]));
+
+        half hsum = __float2half(sum);
         
         // note the += here. This allows us to fuse the P @ V matmul with the addition by Oi so we don't
         // need another chunk of shared memory
         // the optionality prevents us from having to otherwise zero out a matrix first when we don't want to add
         if (add) {
-            res[i*n + j] += sum;
+            res[i*n + j] = __hadd(res[i*n + j], hsum);
         } else {
-            res[i*n + j] = sum;
+            res[i*n + j] = hsum;
         }
     }
 
     __syncthreads();
 }
 
+__device__ inline 
+half max(half a, half b) { return __hgt(a, b) ? a : b; }
+
 
 __global__
-void flash_attention_kernel(const float *Q, const float* K, const float* V, float* O, float* m, float* l, size_t N, size_t d, size_t tc) {
+void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O, half* m, half* l, size_t N, size_t d, size_t tc) {
 
 
     /*
@@ -91,75 +104,102 @@ void flash_attention_kernel(const float *Q, const float* K, const float* V, floa
     - As it turns out, in flash attn 2 and 3 you can pick whatever bc and br you want
     - Then, you go back and allocate your shared memory to be whatever you need
     */ 
-
-    // index in the range of tr
-    size_t j = blockIdx.x;
-
+        
+    const half H_ZERO = __float2half(0);
+    
     // now that Bc and Br are statically known, can do statically allocated sram
     // dynamically allocate shared memory, because we don't know 
     // what our tile sizes will be until runtime (d is dynamic)
-    extern __shared__ float sram[];
+    extern __shared__ half sram[];
 
     // // total size of shared k and v is num of vecs in tile * size of vec
     size_t kv_size = Bc * d;
-    float *K_s = sram;
-    float *V_s = sram + kv_size;
+    half *K_s = sram;
+    half *V_s = sram + kv_size;
 
     size_t qo_size = Br * d;
-    float *Q_s = V_s + kv_size;
-    float *O_s = Q_s + qo_size;
+    half *Q_s = V_s + kv_size;
+    half *O_s = Q_s + qo_size;
 
     // {Brxd} @ {dxBc} = {BrxBc}
     size_t p_size = Br * Bc;
-    float *P_s = O_s + qo_size;
+    half *P_s = O_s + qo_size;
 
-    float* m_s = P_s + p_size;
-    // should be br, because we need Br values of m and l in each shared block
-    float* l_s = m_s + Br;
+    // half* m_s = P_s + p_size;
+    // // should be br, because we need Br values of m and l in each shared block
+    // half* l_s = m_s + Br;
+
+    // try swapping m_s and l_s for registers, since each thread currently only uses one apiece
+    float m_s = -INFINITY;
+    float l_s = 1;
 
     // parallelizing over queries, so load in Q, O tile first
     // remember that each thread block should load in same # of values (except for last)
     // probably assume we have more threads than vectors (everything likely always mult of 32 tho)
     // in this case, we only care about mapping thread index to Bc
-    // with the hyperparam possibilities laid out in flash attn 2, alwyas twice the num of threads
     // remember that your tiles are 2D; each thread loads in a whole vector
-    int r = blockDim.x / Br;
-    if (int idx = threadIdx.x/r; threadIdx.x % r == 0 && j*Br+idx< N) {
-        for (int k=0; k<d; ++k) {
-            Q_s[idx*d + k] = Q[(j*Br + idx)*d + k];
-            O_s[idx*d + k] = O[(j*Br + idx)*d + k];
+
+    // you can just turn off all threads with threadIdx >= Br
+    int idx = Br * blockIdx.x + threadIdx.x;
+    if (threadIdx.x < Br) {
+        // index for a VECTOR of Q
+        if (idx < N) {
+            for (int k=0; k<d; ++k) {
+                Q_s[idx*d + k] = Q[idx*d + k];
+                O_s[idx*d + k] = H_ZERO; //O[(j*Br + idx)*d + k];
+            }
+        } else {
+            for (int k=0; k<d; ++k) {
+                Q_s[idx*d + k] = H_ZERO;
+                O_s[idx*d + k] = H_ZERO;
+            }
         }
-        // only load a single value for m and l vector tiles
-        m_s[idx] = m[j*Br + idx];
-        l_s[idx] = l[j*Br + idx];
     }
-    __syncthreads();
 
-    // if (threadIdx.x == 0 && blockIdx.x == 0) {
-    //     tensorprint(Q_s, Br, d);
-    //     tensorprint(O_s, Br, d);
-    //     tensorprint(m_s, 1, Br);
-    //     tensorprint(l_s, 1, Br);
-    // }
+    // save the syncthreads for later
 
-    r = blockDim.x / Bc;
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        tensorprint(Q_s, Br, d);
+        // tensorprint(O_s, Br, d);
+        // tensorprint(m_s, 1, Br);
+        // tensorprint(l_s, 1, Br);
+    }
+
+    int r = blockDim.x / Bc;
     // loop over kv tiles
     for (size_t i=0; i<tc; ++i) {
         // load tile of k and v into sram
-        if (int idx = threadIdx.x/r; threadIdx.x % r == 0 && i*Bc+idx< N) {
-            for (int k=0; k<d; ++k) {
-                // need to load K transposed; load column into K_s
-                // K_s has rows of len Bc and cols of len d
-                K_s[Bc*k + idx] = K[(i*Bc + idx)*d + k];
-                V_s[idx*d + k] = V[(i*Bc + idx)*d + k];
+        // if we can assume that Bc is always less than blockdim.x, then we just use the first Bc threads
+        if (threadIdx.x < Bc) {
+            int idx = i * Bc + threadIdx.x;
+            if (idx < N) {
+                for (int k=0; k<d; ++k) {
+                    // need to load K transposed; load column into K_s
+                    // K_s has rows of len Bc and cols of len d
+                    // FIXME: QV reads not coalesced at all
+                    K_s[Bc*k + idx] = K[(i*Bc + idx)*d + k];
+                    V_s[idx*d + k] = V[(i*Bc + idx)*d + k];
+                }
+            } else {
+                for (int k=0; k<d; ++k) {
+                    K_s[Bc*k + idx] = H_ZERO;
+                    V_s[idx*d + k] = H_ZERO;
+                }
             }
         }
         __syncthreads();
 
+        // if (threadIdx.x == 0 && blockIdx.x == 0) {
+        //     tensorprint(K_s, d, Bc);
+        //     tensorprint(V_s, Bc, d);
+        // }
 
         // matmul QK^T
         shared_matmul(Q_s, K_s, P_s, Br, d, Bc, false);
-    
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+                printf("P_s before shifted exp:\n");
+                tensorprint(P_s, Br, Bc);
+        }
 
         // define sumexp l_new to divide out at the end
         // no need for shared memory, because row-wise
@@ -169,26 +209,28 @@ void flash_attention_kernel(const float *Q, const float* K, const float* V, floa
         if (threadIdx.x < Br) {
 
             // calculate max over a single row of P_s
-            float mt = -INFINITY;
+            half mt_h = __float2half(-INFINITY);
             for (int i=0; i<Bc; ++i)
-                mt = max(mt, P_s[threadIdx.x*Bc + i]);
-            
+                mt_h = max(mt_h, P_s[threadIdx.x*Bc + i]);
+            float mt = __half2float(mt_h);
             // shifted exponentiation of each row and row-wise sumexp
             float lt = 0;
             for (int i=0; i<Bc; ++i) {
-                float exp = __expf(P_s[threadIdx.x*Bc + i] - mt);
-                P_s[threadIdx.x*Bc + i] = exp;
+                float exp = __expf(__half2float(P_s[threadIdx.x*Bc + i]) - mt);
+                P_s[threadIdx.x*Bc + i] = __float2half(exp);
                 lt += exp;
             }
-            // if (threadIdx.x == 0 && blockIdx.x == 0) {
-            //     printf("P_s after shifted exp:\n");
-            //     tensorprint(P_s, Br, Bc);
-            // }
+            if (threadIdx.x == 0 && blockIdx.x == 0) {
+                printf("P_s after shifted exp:\n");
+                tensorprint(P_s, Br, Bc);
+            }
 
             // compute new m and l for your row
-            float m_new = max(mt, m_s[threadIdx.x]);
-            float old_lse = __expf(m_s[threadIdx.x] - m_new) * l_s[threadIdx.x];
-            l_new = old_lse + __expf(mt - m_new) * lt;
+            float m_new = max(mt, m_s);
+            float old_lse = __expf(m_s - m_new) * l_s;
+            float undo_exp = __expf(mt - m_new);
+            l_new = old_lse + undo_exp * lt;
+            // printf("%d: undo exp is %f, from an mt of %f\n", threadIdx.x, undo_exp, mt);
             
             // // on this first iteration, O_s should be all 0's
             // if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -197,44 +239,45 @@ void flash_attention_kernel(const float *Q, const float* K, const float* V, floa
             // }
 
             // row-wise multiply of old output values
+            // half old_lse_h = __float2half(old_lse);
             for (int i=0; i<d; ++i)
-                O_s[threadIdx.x*d + i] *= old_lse;
+                O_s[threadIdx.x*d + i] = __float2half(__half2float(O_s[threadIdx.x*d + i]) * old_lse);
 
-            
-            
             // scale P's rows by exp(mt - m_new) as in flashattn
+            // half undo_exp_h = __float2half(undo_exp);
             for (int i=0; i<Bc; ++i)
-                P_s[threadIdx.x*Bc+i] *= __expf(mt - m_new);
+                P_s[threadIdx.x*Bc+i] = __float2half(__half2float(P_s[threadIdx.x*Bc+i]) * undo_exp);
             
             // printf("multiplied by %f\n", __expf(mt - m_new));
             // load softmax statistics back to shared memory as the 'old' values
             // FIXME: what of this needs to be in shared memory and what can just go in registers?
-            m_s[threadIdx.x] = m_new;
-            l_s[threadIdx.x] = l_new;
+            m_s = m_new;
+            l_s = l_new;
 
 
         }
         __syncthreads();
-            // should be the same value after exponentiation on the first iteration
-            // if (threadidx.x == 0 && blockidx.x == 0) {
-            //     printf("p_s should be the same as before\n");
-            //     tensorprint(P_s, Br, Bc);
-            //     printf("V_s is:\n");
-            //     tensorprint(V_s, Bc, d);
+        // should be the same value after exponentiation on the first iteration
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            printf("p_s should be the same as before\n");
+            tensorprint(P_s, Br, Bc);
+            printf("V_s is:\n");
+            tensorprint(V_s, Bc, d);
 
-            // }
+        }
 
         shared_matmul(P_s, V_s, O_s, Br, Bc, d);
 
         // divide new O by l_new
         if (threadIdx.x < Br) {
-            float dividend = __fdividef(1, l_new);
+            half dividend = __float2half(__fdividef(1, l_new));
+            // printf("l_new is %f, dividend is %f\n", l_new, __half2float(dividend));
             for (int i=0; i<d; ++i)
-                O_s[threadIdx.x*d + i] *= dividend;
+                O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], dividend);
         }
             
-        // if (threadIdx.x == 0 && blockIdx.x == 0)
-        //     tensorprint(O_s, Br, d);
+        if (threadIdx.x == 0 && blockIdx.x == 0)
+            tensorprint(O_s, Br, d);
 
 
         // don't need to write back to hbm as in the pytorch version, because a thread 
@@ -242,10 +285,9 @@ void flash_attention_kernel(const float *Q, const float* K, const float* V, floa
     }
 
     // write tile of O back to global results
-    r = blockDim.x / Br;
-    if (int idx = threadIdx.x/r; threadIdx.x % r == 0 && j*Br+idx< N) {
+    if (threadIdx.x < Br && idx < N) {
         for (int k=0; k<d; ++k) {
-             O[(j*Br + idx)*d + k] = O_s[idx*d + k];
+            O[idx*d + k] = O_s[idx*d + k];
         }
         // don't worry about saving softmax statistics for now
 
@@ -257,8 +299,27 @@ void flash_attention_kernel(const float *Q, const float* K, const float* V, floa
 
 torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
 
-    // Q, K, V should be same size
-    assert(Q.sizes() == K.sizes() && K.sizes() == V.sizes());
+    hipDeviceProp_t props;
+    hipGetDeviceProperties(&props, 0);
+
+    std::cout << "  Shared Memory per Block: " << props.sharedMemPerBlock / 1024.0 << " KB" << std::endl;
+    std::cout << "  Shared Memory Banks: " << props.regsPerBlock << std::endl;
+    std::cout << "  Warp Size: " << props.warpSize << std::endl;
+    std::cout << "  Max Threads per Block: " << props.maxThreadsPerBlock << std::endl;
+    std::cout << "  Max Threads per Multiprocessor: " << props.maxThreadsPerMultiProcessor << std::endl;
+    std::cout << std::endl;
+
+
+    if (!(Q.sizes() == K.sizes() && K.sizes() == V.sizes())) {
+       printf("Q, K, V must be same size\n");
+       return Q;
+    } 
+
+    if (!(Q.dtype() == torch::kHalf && K.dtype() == torch::kHalf && V.dtype() == torch::kHalf)) {
+        printf("kernel implemented in fp16 only\n");
+        return Q;
+    } 
+
     
     size_t N = Q.size(0);
     size_t d = Q.size(1);
@@ -267,10 +328,11 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 
     // // hold up all these values are knowable before runtime
     // // size and num of KV tiles
-    size_t tc = ceil(N / Bc);
+    size_t tc = max(N / Bc, 1L);
 
     // // size and num of Q, O tiles
-    size_t tr = ceil(N / Br);
+    size_t tr = max(N / Br, 1L);
+    printf("tc=%d, tr=%d\n", tc, tr);
 
     // instantiate extra tensors
     auto options = torch::TensorOptions().device(Q.device()).dtype(Q.dtype()); 
@@ -285,26 +347,33 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     size_t qo_size = Br * d;
     size_t p_size = Br * Bc;
     // shared for K, V, Q, O, m, l
-    size_t smem_size = sizeof(float) * (2*kv_size + 2*qo_size + p_size + 2*Br);
+    // don't allocate shared for m and l now
+    size_t smem_size = sizeof(half) * (2*kv_size + 2*qo_size + p_size);
 
-    std::cout << "Launching kernel with smem size" << smem_size << "\n";
+    std::cout << "Launching kernel with smem size " << smem_size << "\n";
 
-    // want flat thread grid
-   hipLaunchKernelGGL(( flash_attention_kernel), dim3(tr), dim3(32), smem_size, 0, 
-        (float*)Q.const_data_ptr(), (float*)K.const_data_ptr(), (float*)V.const_data_ptr(), 
-        (float*)O.mutable_data_ptr(), (float*)m.mutable_data_ptr(), (float*)l.mutable_data_ptr(),
-        N, d, tc);
+    std::cout << std::flush;
+    if (smem_size > props.sharedMemPerBlock) {
+        printf("Too much shared memory requested per block\n");
+    } else {
+        // want flat thread grid
+       hipLaunchKernelGGL(( flash_attention_kernel), dim3(tr), dim3(32*N_WARPS), smem_size, 0, 
+            (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
+            (half*)O.mutable_data_ptr(), (half*)m.mutable_data_ptr(), (half*)l.mutable_data_ptr(),
+            N, d, tc);
 
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-        printf("Error running kernel: %s\n", hipGetErrorString(err));
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            printf("Error running kernel: %s\n", hipGetErrorString(err));
+        }
     }
 
+    
     return O;
 }
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("flash_attn", torch::wrap_pybind_function(flash_attention), "flasn_attn");
+    m.def("flash_attn", torch::wrap_pybind_function(flash_attention), "flash_attn");
 }
