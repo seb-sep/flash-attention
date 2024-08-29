@@ -61,18 +61,18 @@ void shared_matmul(half* A, half* B, half* res, size_t m, size_t k, size_t n, bo
         float sum = 0;
         // so, calculate output value for i and j
         for (int q=0; q<k; ++q)
-            // sum += __half2float(__hmul(A[i*k + q], B[n*q + j]));
-            sum += __half2float(A[i*k + q]) * __half2float(B[n*q + j]);
+            sum += __half2float(__hmul(A[i*k + q], B[n*q + j]));
+            // sum += __half2float(A[i*k + q]) * __half2float(B[n*q + j]);
 
-        // half hsum = __float2half(sum);
+        half hsum = __float2half(sum);
         
         // note the += here. This allows us to fuse the P @ V matmul with the addition by Oi so we don't
         // need another chunk of shared memory
         // the optionality prevents us from having to otherwise zero out a matrix first when we don't want to add
         if (add) {
-            res[i*n + j] = __float2half(__half2float(res[i*n + j]) + sum);
+            res[i*n + j] = __hadd(res[i*n + j], hsum);
         } else {
-            res[i*n + j] = __float2half(sum);
+            res[i*n + j] = hsum;
         }
     }
 
@@ -148,7 +148,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         if (idx < N) {
             for (int k=0; k<d; ++k) {
                 // apply scaling factor here instead of after QK^T; this prevents matmul from overflowing
-                Q_s[threadIdx.x*d + k] = (Q[idx*d + k]);
+                Q_s[threadIdx.x*d + k] = Q[idx*d + k];
                 O_s[threadIdx.x*d + k] = H_ZERO; //O[(j*Br + idx)*d + k];
             }
         } else {
@@ -252,7 +252,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
             //     tensorprint(O_s, Br, d);
             // }
             for (int i=0; i<d; ++i)
-                O_s[threadIdx.x*d + i] = __float2half(__half2float(O_s[threadIdx.x*d + i]) * old_lse);
+                O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], __float2half(old_lse));
             
             // only necessary for now
             // __syncthreads();
@@ -264,7 +264,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
             // scale P's rows by exp(mt - m_new) as in flashattn
             // half undo_exp_h = __float2half(undo_exp);
             for (int i=0; i<Bc; ++i)
-                P_s[threadIdx.x*Bc+i] = __float2half(__half2float(P_s[threadIdx.x*Bc+i]) * undo_exp);
+                P_s[threadIdx.x*Bc+i] = __hmul(P_s[threadIdx.x*Bc+i], __float2half(undo_exp));
             
             // printf("multiplied by %f\n", __expf(mt - m_new));
             // load softmax statistics back to shared memory as the 'old' values
@@ -292,10 +292,10 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
         // divide new O by l_new
         if (threadIdx.x < Br) {
-            float dividend = __fdividef(1, l_new);
+            half dividend = __float2half(__fdividef(1, l_new));
             // printf("l_new is %f, dividend is %f\n", l_new, dividend);
             for (int i=0; i<d; ++i)
-                O_s[threadIdx.x*d + i] = __float2half(__half2float(O_s[threadIdx.x*d + i]) * dividend);
+                O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], dividend);
         }
             
         // if (threadIdx.x == 0 && blockIdx.x == 1) {
