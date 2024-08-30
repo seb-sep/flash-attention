@@ -19,8 +19,8 @@
 // because of sram limitations, I can't afford the same block sizes and thus I should probably allocate less warps per block
 // Br should always be at least 32, since many parts of the kernel are row-wise over tiles of height Br
 // Furthermore, as long as things are threadwise over Br, Br should always be larger than Bc and generally as large as possible
-const size_t Br = 8;
-const size_t Bc = 4;
+const size_t Br = 64;
+const size_t Bc = 32;
 const size_t N_WARPS = Br / 32 + (Br%32!=0);
 
 
@@ -126,6 +126,9 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     // {Brxd} @ {dxBc} = {BrxBc}
     size_t p_size = Br * Bc;
     half *P_s = O_s + qo_size;
+
+
+
 
     // half* m_s = P_s + p_size;
     // // should be br, because we need Br values of m and l in each shared block
@@ -325,15 +328,16 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
 torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
 
-    // hipDeviceProp_t props;
-    // hipGetDeviceProperties(&props, 0);
+    hipDeviceProp_t props;
+    hipGetDeviceProperties(&props, 0);
 
-    // std::cout << "  Shared Memory per Block: " << props.sharedMemPerBlock / 1024.0 << " KB" << std::endl;
-    // std::cout << "  Shared Memory Banks: " << props.regsPerBlock << std::endl;
-    // std::cout << "  Warp Size: " << props.warpSize << std::endl;
-    // std::cout << "  Max Threads per Block: " << props.maxThreadsPerBlock << std::endl;
-    // std::cout << "  Max Threads per Multiprocessor: " << props.maxThreadsPerMultiProcessor << std::endl;
-    // std::cout << std::endl;
+    std::cout << "  Shared Memory per Block: " << props.sharedMemPerBlock << std::endl;
+    std::cout << "  Shared Memory Banks: " << props.regsPerBlock << std::endl;
+    std::cout << "  Warp Size: " << props.warpSize << std::endl;
+    std::cout << "  Max Threads per Block: " << props.maxThreadsPerBlock << std::endl;
+    std::cout << "  Constant Memory: " << props.totalConstMem << std::endl;
+    std::cout << "  L2 Cache: " << props.l2CacheSize << std::endl;
+    std::cout << std::endl;
 
 
     if (!(Q.sizes() == K.sizes() && K.sizes() == V.sizes())) {
@@ -377,27 +381,29 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     float scaling_factor = (1 / sqrt(d));
     // std::cout << "scaling QK^T by " << (scaling_factor) << "\n";
 
-    // std::cout << "Launching kernel with smem size " << smem_size << "\n";
+    std::cout << "Launching kernel with smem size " << smem_size << "\n";
 
-    // if (smem_size > props.sharedMemPerBlock) {
-    //     printf("Too much shared memory requested per block\n");
-    // } else {
+    if (smem_size > props.sharedMemPerBlock) {
+        printf("Too much shared memory requested per block\n");
+    } else {
         // want flat thread grid
        hipLaunchKernelGGL(( flash_attention_kernel), dim3(tr), dim3(32*N_WARPS), smem_size, 0, 
             (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
             (half*)O.mutable_data_ptr(), 1, N, d, tc);
 
-        // hipError_t err = hipGetLastError();
-        // if (err != hipSuccess) {
-        //     printf("Error running kernel: %s\n", hipGetErrorString(err));
-        // }
-    // }
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            printf("Error running kernel: %s\n", hipGetErrorString(err));
+        }
+    }
 
     
     return O;
 }
 
 void benchmark_flash_attn(int N, int d, int n_iters=100) {
+
+    printf("Running %d iters of flash attn on %d x %d matrices\n", n_iters, N, d);
     
     auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kHalf);
     torch::Tensor Q = torch::rand({N, d}, options);
