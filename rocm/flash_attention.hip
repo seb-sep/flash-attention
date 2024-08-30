@@ -20,7 +20,7 @@
 // Br should always be at least 32, since many parts of the kernel are row-wise over tiles of height Br
 // Furthermore, as long as things are threadwise over Br, Br should always be larger than Bc and generally as large as possible
 const size_t Br = 64;
-const size_t Bc = 32;
+const size_t Bc = 48;
 const size_t N_WARPS = Br / 32 + (Br%32!=0);
 
 
@@ -427,6 +427,7 @@ void benchmark_flash_attn(int N, int d, int n_iters=100) {
                 (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
                 (half*)O.mutable_data_ptr(), 1, N, d, tc);
    
+    printf("done!\n");
 
 
 }
