@@ -8,7 +8,7 @@ PROF_FOLDER=profiling/prof_results
 
 # run on remote
 profile:
-	rocprof --tool-version 1 --hip-trace -t /tmp -d $(PROF_FOLDER) $(PYTHON) profiling/prof_flashattn.py
+	rocprofv2 -i profiling/profile.txt -t /tmp -d $(PROF_FOLDER) $(PYTHON) profiling/prof_flashattn.py
 	mv results.json results.copy_stats.csv results.db results.hip_stats.csv results.stats.csv results.sysinfo.txt $(PROF_FOLDER)
 
 profile-add:

@@ -325,8 +325,8 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
 torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
 
-    hipDeviceProp_t props;
-    hipGetDeviceProperties(&props, 0);
+    // hipDeviceProp_t props;
+    // hipGetDeviceProperties(&props, 0);
 
     // std::cout << "  Shared Memory per Block: " << props.sharedMemPerBlock / 1024.0 << " KB" << std::endl;
     // std::cout << "  Shared Memory Banks: " << props.regsPerBlock << std::endl;
@@ -358,7 +358,7 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 
     // // size and num of Q, O tiles
     size_t tr = N / Br + (N%Br!=0);
-    printf("tc=%d, tr=%d\n", tc, tr);
+    // printf("tc=%d, tr=%d\n", tc, tr);
 
     // instantiate extra tensors
     auto options = torch::TensorOptions().device(Q.device()).dtype(Q.dtype()); 
@@ -377,29 +377,57 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     float scaling_factor = (1 / sqrt(d));
     // std::cout << "scaling QK^T by " << (scaling_factor) << "\n";
 
-    std::cout << "Launching kernel with smem size " << smem_size << "\n";
+    // std::cout << "Launching kernel with smem size " << smem_size << "\n";
 
-    std::cout << std::flush;
-    if (smem_size > props.sharedMemPerBlock) {
-        printf("Too much shared memory requested per block\n");
-    } else {
+    // if (smem_size > props.sharedMemPerBlock) {
+    //     printf("Too much shared memory requested per block\n");
+    // } else {
         // want flat thread grid
        hipLaunchKernelGGL(( flash_attention_kernel), dim3(tr), dim3(32*N_WARPS), smem_size, 0, 
             (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
             (half*)O.mutable_data_ptr(), 1, N, d, tc);
 
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess) {
-            printf("Error running kernel: %s\n", hipGetErrorString(err));
-        }
-    }
+        // hipError_t err = hipGetLastError();
+        // if (err != hipSuccess) {
+        //     printf("Error running kernel: %s\n", hipGetErrorString(err));
+        // }
+    // }
 
     
     return O;
+}
+
+void benchmark_flash_attn(int N, int d, int n_iters=100) {
+    
+    auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kHalf);
+    torch::Tensor Q = torch::rand({N, d}, options);
+    torch::Tensor K = torch::rand({N, d}, options);
+    torch::Tensor V = torch::rand({N, d}, options);
+
+    // if I don't re instantiate each time, this will be incorrect
+    torch::Tensor O = torch::zeros_like(Q);
+
+    size_t kv_size = Bc * d;
+    size_t qo_size = Br * d;
+    size_t p_size = Br * Bc;
+    // shared for K, V, Q, O, m, l
+    // don't allocate shared for m and l now
+    size_t smem_size = sizeof(half) * (2*kv_size + 2*qo_size + p_size);
+    size_t tc = N / Bc + (N%Bc!=0);
+    size_t tr = N / Br + (N%Br!=0);
+
+    for (int i=0; i<n_iters; ++i)
+       hipLaunchKernelGGL(( flash_attention_kernel), dim3(tr), dim3(32*N_WARPS), smem_size, 0, 
+                (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
+                (half*)O.mutable_data_ptr(), 1, N, d, tc);
+   
+
+
 }
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("flash_attn", torch::wrap_pybind_function(flash_attention), "flash_attn");
+    m.def("run_bench", torch::wrap_pybind_function(benchmark_flash_attn), "get benchmark for flash attn");
 }
