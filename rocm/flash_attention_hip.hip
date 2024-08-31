@@ -8,6 +8,10 @@
 #include <iostream>
 #include <utility>
 
+/*
+BIG ISSUE: when the input Q has a O, and K has some -infs (because of padding), output is nan instead of -inf, which propagates down
+*/
+
 // in flash attn 2, set to either 64 or 128, can basically pick what you want as long as 
 // you have the sram for it
 // also number of threads per block
@@ -19,8 +23,10 @@
 // because of sram limitations, I can't afford the same block sizes and thus I should probably allocate less warps per block
 // Br should always be at least 32, since many parts of the kernel are row-wise over tiles of height Br
 // Furthermore, as long as things are threadwise over Br, Br should always be larger than Bc and generally as large as possible
-const size_t Br = 64;
-const size_t Bc = 32;
+const size_t Br = 32;
+const size_t Bc = 48;
+// const size_t Br = 8;
+// const size_t Bc = 4;
 const size_t N_WARPS = Br / 32 + (Br%32!=0);
 
 
@@ -65,6 +71,9 @@ void shared_matmul(half* A, half* B, half* res, size_t m, size_t k, size_t n, bo
             // sum += __half2float(A[i*k + q]) * __half2float(B[n*q + j]);
 
         half hsum = __float2half(sum);
+
+        if (__hisnan(hsum))
+            printf("Value %d %d of result matrix is nan\n", i, j);
         
         // note the += here. This allows us to fuse the P @ V matmul with the addition by Oi so we don't
         // need another chunk of shared memory
@@ -79,8 +88,49 @@ void shared_matmul(half* A, half* B, half* res, size_t m, size_t k, size_t n, bo
     __syncthreads();
 }
 
-__device__ inline 
+__device__ __forceinline__ 
 half max(half a, half b) { return __hgt(a, b) ? a : b; }
+
+// Load n_elems values from one pointer to another. Happens blockwise 1D
+// if size_to less than size_from, some values not copied over
+// if size_from less than size_to, padding value loaded instead
+// Does NOT syncthreads
+// FIXME: does it matter if inlined???
+// FIXME: is it faster to call this then zero O or should the writes to shared be fused?
+template <typename T> 
+__device__ __forceinline__ void load_coalesced(const T* from, T* to, const size_t size_from, const size_t size_to, T pad_value) {
+    auto n_iters = size_to / blockDim.x + (size_to%blockDim.x != 0);
+    for (int i=0; i<n_iters; ++i) {
+        // indices should line up perfectly between to and from, assume 
+        // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+        int idx = blockDim.x * i + threadIdx.x;
+        // maybe still faster to have all threads loading instead of turning off enough to get an even size?
+        if (idx < size_to)
+            to[idx] = idx < size_from ? from[idx] : pad_value;
+    }
+
+}
+
+// rows and cols are the dims of the ORIGINAL matrix, not what's loaded in
+// Coalesced in from, NOT to
+// no syncthreads
+template <typename T> 
+__device__ __forceinline__ void load_coalesced_transpose(const T* from, T* to, const size_t size_from, const size_t size_to, T pad_value, size_t rows, size_t cols) {
+    auto n_iters = size_to / blockDim.x + (size_to%blockDim.x != 0);
+    for (int k=0; k<n_iters; ++k) {
+        // indices should line up perfectly between to and from, assume 
+        // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+        int from_idx = blockDim.x * k + threadIdx.x;
+        // get the 2D indices from the linearized access, flip them to get correct transposed linearized access
+        int i = from_idx / cols;
+        int j = from_idx % cols;
+        int to_idx = rows * j + i;
+        // printf("index %d, position %d, %d in original\n", from_idx, i, j);
+        // maybe still faster to have all threads loading instead of turning off enough to get an even size?
+        if (from_idx < size_to)
+            to[to_idx] = from_idx < size_from ? from[from_idx] : pad_value;
+    }
+}
 
 
 __global__
@@ -107,7 +157,8 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     */ 
         
     const half H_ZERO = __float2half(0);
-    const half H_NINF = __float2half(-INFINITY);
+    // use largest negative instead of inf, because if you ever multiply -inf by 0 you're in big trouble
+    const half H_MIN = __float2half(-65504.0f);
     
     // now that Bc and Br are statically known, can do statically allocated sram
     // dynamically allocate shared memory, because we don't know 
@@ -144,29 +195,35 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     // in this case, we only care about mapping thread index to Bc
     // remember that your tiles are 2D; each thread loads in a whole vector
 
-    // you can just turn off all threads with threadIdx >= Br
-    int idx = Br * blockIdx.x + threadIdx.x;
-    if (threadIdx.x < Br) {
-        // index for a VECTOR of Q
-        if (idx < N) {
-            for (int k=0; k<d; ++k) {
-                // apply scaling factor here instead of after QK^T; this prevents matmul from overflowing
-                Q_s[threadIdx.x*d + k] = Q[idx*d + k];
-                O_s[threadIdx.x*d + k] = H_ZERO; //O[(j*Br + idx)*d + k];
-            }
-        } else {
-            for (int k=0; k<d; ++k) {
-                Q_s[threadIdx.x*d + k] = H_NINF;
-                O_s[threadIdx.x*d + k] = H_ZERO;
-            }
-        }
-    }
+    // Index of the Q/O vector to start from
+    int qo_idx = Br * blockIdx.x;
+    // if (threadIdx.x < Br) {
+    //     // index for a VECTOR of Q
+    //     if (idx < N) {
+    //         for (int k=0; k<d; ++k) {
+    //             // apply scaling factor here instead of after QK^T; this prevents matmul from overflowing
+    //             Q_s[threadIdx.x*d + k] = Q[idx*d + k];
+    //             O_s[threadIdx.x*d + k] = H_ZERO; //O[(j*Br + idx)*d + k];
+    //         }
+    //     } else {
+    //         for (int k=0; k<d; ++k) {
+    //             Q_s[threadIdx.x*d + k] = H_NINF;
+    //             O_s[threadIdx.x*d + k] = H_ZERO;
+    //         }
+    //     }
+    // }
+    // load from should be however many vals left; if this happens to be >=N, nothing changes
+    // otherwise, it loads the padded value
+    load_coalesced(&Q[qo_idx*d], Q_s, (N-qo_idx)*d, Br*d, H_ZERO);
+    load_coalesced((half*)nullptr, O_s, 0, Br*d, H_ZERO); // zero out shared
+    __syncthreads();
 
     // save the syncthreads for later
 
-    // if (threadIdx.x == 0 && blockIdx.x == 1) {
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
     //     printf("Q:\n");
     //     tensorprint(Q_s, Br, d);
+    //     printf("O:\n");
         // tensorprint(O_s, Br, d);
         // tensorprint(m_s, 1, Br);
         // tensorprint(l_s, 1, Br);
@@ -174,29 +231,18 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
     int r = blockDim.x / Bc;
     // loop over kv tiles
+    int kv_idx;
     for (size_t i=0; i<tc; ++i) {
+
+        // Index of the KV vector to start from
+        kv_idx = Bc * i;
+
         // load tile of k and v into sram
-        // if we can assume that Bc is always less than blockdim.x, then we just use the first Bc threads
-        if (threadIdx.x < Bc) {
-            int idx = i * Bc + threadIdx.x;
-            if (idx < N) {
-                for (int k=0; k<d; ++k) {
-                    // need to load K transposed; load column into K_s
-                    // K_s has rows of len Bc and cols of len d
-                    // FIXME: QV reads not coalesced at all
-                    K_s[Bc*k + threadIdx.x] = K[idx*d + k];
-                    V_s[threadIdx.x*d + k] = V[idx*d + k];
-                }
-            } else {
-                for (int k=0; k<d; ++k) {
-                    K_s[Bc*k + threadIdx.x] = H_NINF;
-                    V_s[threadIdx.x*d + k] = H_ZERO;
-                }
-            }
-        }
+        load_coalesced_transpose(&K[kv_idx*d], K_s, (N-kv_idx)*d, Bc*d, H_MIN, Bc, d);
+        load_coalesced(&V[kv_idx*d], V_s, (N-kv_idx)*d, Bc*d, H_ZERO);
         __syncthreads();
 
-        // if (threadIdx.x == 0 && blockIdx.x == 1) {
+        // if (threadIdx.x == 0 && blockIdx.x == 0) {
         //     printf("K^T:\n");
         //     tensorprint(K_s, d, Bc);
         //     printf("V:\n");
@@ -204,8 +250,10 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // }
 
         // matmul QK^T
+        // if (threadIdx.x == 0 && blockIdx.x == 0)
+        //     printf("Performkng QKT");
         shared_matmul(Q_s, K_s, P_s, Br, d, Bc, false);
-        // if (threadIdx.x == 0 && blockIdx.x == 1) {
+        // if (threadIdx.x == 0 && blockIdx.x == 0) {
         //         printf("P_s before shifted exp:\n");
         //         tensorprint(P_s, Br, Bc);
         // }
@@ -218,7 +266,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         if (threadIdx.x < Br) {
 
             // calculate max over a single row of P_s
-            half mt_h = H_NINF;
+            half mt_h = H_MIN;
             for (int i=0; i<Bc; ++i)
                 mt_h = max(mt_h, P_s[threadIdx.x*Bc + i]);
             float mt = __half2float(mt_h);
@@ -229,7 +277,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
                 P_s[threadIdx.x*Bc + i] = __float2half(exp);
                 lt += exp;
             }
-            // if (threadIdx.x == 0 && blockIdx.x == 1) {
+            // if (threadIdx.x == 0 && blockIdx.x == 0) {
             //     printf("P_s after shifted exp:\n");
             //     tensorprint(P_s, Br, Bc);
             // }
@@ -287,6 +335,8 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
         // }
 
+        // if (threadIdx.x == 0 && blockIdx.x == 0)
+        //     printf("Performkng PV");
         shared_matmul(P_s, V_s, O_s, Br, Bc, d);
         // if (threadIdx.x == 0 && blockIdx.x == 1) {
         //     printf("Oi after the matmul:\n");
@@ -296,6 +346,8 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // divide new O by l_new
         if (threadIdx.x < Br) {
             half dividend = __float2half(__fdividef(1, l_new));
+            // if (__hisinf(dividend) || __hisnan(dividend))
+            //     printf("dividend is inf or nan, l_new is %f\n", l_new);
             // printf("l_new is %f, dividend is %f\n", l_new, dividend);
             for (int i=0; i<d; ++i)
                 O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], dividend);
@@ -313,14 +365,15 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
     // write tile of O back to global results
     // a bunch of these will be garbage if from padded values
-    if (threadIdx.x < Br && idx < N) {
-        for (int k=0; k<d; ++k) {
-            // printf("Writing %f back to dimension %d of output token %d\n", O_s[idx*d + k], k, idx);
-            O[idx*d + k] = O_s[threadIdx.x*d + k];
-        }
-        // don't worry about saving softmax statistics for now
+    // if (threadIdx.x < Br && idx < N) {
+    //     for (int k=0; k<d; ++k) {
+    //         // printf("Writing %f back to dimension %d of output token %d\n", O_s[idx*d + k], k, idx);
+    //         O[idx*d + k] = O_s[threadIdx.x*d + k];
+    //     }
+    //     // don't worry about saving softmax statistics for now
 
-    }
+    // }
+    load_coalesced(O_s, &O[qo_idx*d], Br*d, (N-qo_idx)*d, H_ZERO);
     __syncthreads();
 
 }
@@ -423,10 +476,11 @@ void benchmark_flash_attn(int N, int d, int n_iters=100) {
     size_t tr = N / Br + (N%Br!=0);
 
     for (int i=0; i<n_iters; ++i)
-       hipLaunchKernelGGL(( flash_attention_kernel), dim3(tr), dim3(32*N_WARPS), smem_size, 0, 
+       hipLaunchKernelGGL(( flash_attention_kernel), dim3(tr), dim3(Br), smem_size, 0, 
                 (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
                 (half*)O.mutable_data_ptr(), 1, N, d, tc);
    
+    printf("done!\n");
 
 
 }
