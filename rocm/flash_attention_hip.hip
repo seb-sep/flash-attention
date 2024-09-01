@@ -479,6 +479,7 @@ void benchmark_flash_attn(int N, int d, int n_iters=100) {
                 (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
                 (half*)O.mutable_data_ptr(), 1, N, d, tc);
     hipEventRecord(stop);
+    hipEventSynchronize(stop);
     float ms = 0;
     hipEventElapsedTime(&ms, start, stop);
     printf("%d iters of flash attention complete in %f ms!\n", n_iters, ms);
