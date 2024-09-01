@@ -72,9 +72,6 @@ void shared_matmul(half* A, half* B, half* res, size_t m, size_t k, size_t n, bo
 
         half hsum = __float2half(sum);
 
-        if (__hisnan(hsum))
-            printf("Value %d %d of result matrix is nan\n", i, j);
-        
         // note the += here. This allows us to fuse the P @ V matmul with the addition by Oi so we don't
         // need another chunk of shared memory
         // the optionality prevents us from having to otherwise zero out a matrix first when we don't want to add
@@ -158,7 +155,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         
     const half H_ZERO = __float2half(0);
     // use largest negative instead of inf, because if you ever multiply -inf by 0 you're in big trouble
-    const half H_MIN = __float2half(-65504.0f);
+    const half H_MIN = __float2half(-65500.0f);
     
     // now that Bc and Br are statically known, can do statically allocated sram
     // dynamically allocate shared memory, because we don't know 
@@ -220,8 +217,8 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
     // save the syncthreads for later
 
-    // if (threadIdx.x == 0 && blockIdx.x == 0) {
-    //     printf("Q:\n");
+    // if (threadIdx.x == 0 && blockIdx.x == 1) {
+    //     printf("Q block %d:\n", blockIdx.x);
     //     tensorprint(Q_s, Br, d);
     //     printf("O:\n");
         // tensorprint(O_s, Br, d);
@@ -242,18 +239,18 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         load_coalesced(&V[kv_idx*d], V_s, (N-kv_idx)*d, Bc*d, H_ZERO);
         __syncthreads();
 
-        // if (threadIdx.x == 0 && blockIdx.x == 0) {
-        //     printf("K^T:\n");
+        // if (threadIdx.x == 0 && blockIdx.x==1) {
+        //     printf("K^T block %d:\n", blockIdx.x);
         //     tensorprint(K_s, d, Bc);
-        //     printf("V:\n");
+        //     printf("V block %d:\n", blockIdx.x);
         //     tensorprint(V_s, Bc, d);
         // }
 
-        // matmul QK^T
+        // // matmul QK^T
         // if (threadIdx.x == 0 && blockIdx.x == 0)
         //     printf("Performkng QKT");
         shared_matmul(Q_s, K_s, P_s, Br, d, Bc, false);
-        // if (threadIdx.x == 0 && blockIdx.x == 0) {
+        // if (threadIdx.x == 0 && blockIdx.x == 2) {
         //         printf("P_s before shifted exp:\n");
         //         tensorprint(P_s, Br, Bc);
         // }
@@ -263,68 +260,66 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         float l_new;
         // calculate new maxes
         // for all these row-wise ops, just use the first Br threads per block to minimize warp divergence
-        if (threadIdx.x < Br) {
 
-            // calculate max over a single row of P_s
-            half mt_h = H_MIN;
-            for (int i=0; i<Bc; ++i)
-                mt_h = max(mt_h, P_s[threadIdx.x*Bc + i]);
-            float mt = __half2float(mt_h);
-            // shifted exponentiation of each row and row-wise sumexp
-            float lt = 0;
-            for (int i=0; i<Bc; ++i) {
-                float exp = __expf(__half2float(P_s[threadIdx.x*Bc + i]) - mt);
-                P_s[threadIdx.x*Bc + i] = __float2half(exp);
-                lt += exp;
-            }
-            // if (threadIdx.x == 0 && blockIdx.x == 0) {
-            //     printf("P_s after shifted exp:\n");
-            //     tensorprint(P_s, Br, Bc);
-            // }
-
-            // compute new m and l for your row
-            float m_new = max(mt, m_s);
-            float old_lse = __expf(m_s - m_new) * l_s;
-            float undo_exp = __expf(mt - m_new);
-            l_new = old_lse + undo_exp * lt;
-            // printf("%d: undo exp is %f, from an mt of %f\n", threadIdx.x, undo_exp, mt);
-            
-            // on this first iteration, O_s should be all 0's
-            // if (threadIdx.x == 0 && blockIdx.x == 1) {
-            //     printf("O_s should be zeros on first iter, than something else (before being multiplied by %f):\n", old_lse);
-            //     tensorprint(O_s, Br, d);
-            // }
-
-            // row-wise multiply of old output values
-            // half old_lse_h = __float2half(old_lse);
-
-            // if (threadIdx.x == 0 && blockIdx.x == 1) {
-            //     printf("Old Oi before getting renomalized:\n");
-            //     tensorprint(O_s, Br, d);
-            // }
-            for (int i=0; i<d; ++i)
-                O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], __float2half(old_lse));
-            
-            // only necessary for now
-            // __syncthreads();
-
-            // if (threadIdx.x == 0 && blockIdx.x == 1) {
-            //     printf("Oi after getting renomalized:\n");
-            //     tensorprint(O_s, Br, d);
-            // }
-            // scale P's rows by exp(mt - m_new) as in flashattn
-            // half undo_exp_h = __float2half(undo_exp);
-            for (int i=0; i<Bc; ++i)
-                P_s[threadIdx.x*Bc+i] = __hmul(P_s[threadIdx.x*Bc+i], __float2half(undo_exp));
-            
-            // printf("multiplied by %f\n", __expf(mt - m_new));
-            // load softmax statistics back to shared memory as the 'old' values
-            // FIXME: what of this needs to be in shared memory and what can just go in registers?
-            m_s = m_new;
-            l_s = l_new;
-
-
+        // calculate max over a single row of P_s
+        half mt_h = H_MIN;
+        for (int i=0; i<Bc; ++i)
+            mt_h = max(mt_h, P_s[threadIdx.x*Bc + i]);
+        float mt = __half2float(mt_h);
+        // shifted exponentiation of each row and row-wise sumexp
+        float lt = 0;
+        for (int i=0; i<Bc; ++i) {
+            float exp = __expf(__half2float(P_s[threadIdx.x*Bc + i]) - mt);
+            P_s[threadIdx.x*Bc + i] = __float2half(exp);
+            lt += exp;
         }
+        // if (threadIdx.x == 0 && blockIdx.x == 2) {
+        //     printf("P_s after shifted exp:\n");
+        //     tensorprint(P_s, Br, Bc);
+        // }
+
+        // compute new m and l for your row
+        float m_new = max(mt, m_s);
+        float old_lse = __expf(m_s - m_new) * l_s;
+        float undo_exp = __expf(mt - m_new);
+        l_new = old_lse + undo_exp * lt;
+        // printf("%d: undo exp is %f, from an mt of %f\n", threadIdx.x, undo_exp, mt);
+        
+        // on this first iteration, O_s should be all 0's
+        // if (threadIdx.x == 0 && blockIdx.x == 1) {
+        //     printf("O_s should be zeros on first iter, than something else (before being multiplied by %f):\n", old_lse);
+        //     tensorprint(O_s, Br, d);
+        // }
+
+        // row-wise multiply of old output values
+        // half old_lse_h = __float2half(old_lse);
+
+        // if (threadIdx.x == 0 && blockIdx.x == 1) {
+        //     printf("Old Oi before getting renomalized:\n");
+        //     tensorprint(O_s, Br, d);
+        // }
+        for (int i=0; i<d; ++i)
+            O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], __float2half(old_lse));
+        
+        // only necessary for now
+        // __syncthreads();
+
+        // if (threadIdx.x == 0 && blockIdx.x == 1) {
+        //     printf("Oi after getting renomalized:\n");
+        //     tensorprint(O_s, Br, d);
+        // }
+        // scale P's rows by exp(mt - m_new) as in flashattn
+        // half undo_exp_h = __float2half(undo_exp);
+        for (int i=0; i<Bc; ++i)
+            P_s[threadIdx.x*Bc+i] = __hmul(P_s[threadIdx.x*Bc+i], __float2half(undo_exp));
+        
+        // printf("multiplied by %f\n", __expf(mt - m_new));
+        // load softmax statistics back to shared memory as the 'old' values
+        // FIXME: what of this needs to be in shared memory and what can just go in registers?
+        m_s = m_new;
+        l_s = l_new;
+
+
         __syncthreads();
         // should be the same value after exponentiation on the first iteration
         // if (threadIdx.x == 0 && blockIdx.x == 1) {
@@ -344,14 +339,12 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // }
 
         // divide new O by l_new
-        if (threadIdx.x < Br) {
-            half dividend = __float2half(__fdividef(1, l_new));
-            // if (__hisinf(dividend) || __hisnan(dividend))
-            //     printf("dividend is inf or nan, l_new is %f\n", l_new);
-            // printf("l_new is %f, dividend is %f\n", l_new, dividend);
-            for (int i=0; i<d; ++i)
-                O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], dividend);
-        }
+        half dividend = __float2half(__fdividef(1, l_new));
+        // if (__hisinf(dividend) || __hisnan(dividend))
+        //     printf("dividend is inf or nan, l_new is %f\n", l_new);
+        // printf("l_new is %f, dividend is %f\n", l_new, dividend);
+        for (int i=0; i<d; ++i)
+            O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], dividend);
             
         // if (threadIdx.x == 0 && blockIdx.x == 1) {
         //     printf("Oi after divided by l_new; end of block:\n");
@@ -373,7 +366,8 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     //     // don't worry about saving softmax statistics for now
 
     // }
-    load_coalesced(O_s, &O[qo_idx*d], Br*d, (N-qo_idx)*d, H_ZERO);
+    // qo_idx + Br < N, then Br, otherwise, N - qo-idx
+    load_coalesced(O_s, &O[qo_idx*d], Br*d, min(Br, N-qo_idx)*d, H_ZERO);
     __syncthreads();
 
 }
@@ -415,7 +409,7 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 
     // // size and num of Q, O tiles
     size_t tr = N / Br + (N%Br!=0);
-    // printf("tc=%d, tr=%d\n", tc, tr);
+    printf("tc=%d, tr=%d\n", tc, tr);
 
     // instantiate extra tensors
     auto options = torch::TensorOptions().device(Q.device()).dtype(Q.dtype()); 
@@ -475,12 +469,22 @@ void benchmark_flash_attn(int N, int d, int n_iters=100) {
     size_t tc = N / Bc + (N%Bc!=0);
     size_t tr = N / Br + (N%Br!=0);
 
+    hipEvent_t start, stop;
+    hipEventCreate(&start);
+    hipEventCreate(&stop);
+    hipEventRecord(start);
+
     for (int i=0; i<n_iters; ++i)
        hipLaunchKernelGGL(( flash_attention_kernel), dim3(tr), dim3(Br), smem_size, 0, 
                 (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
                 (half*)O.mutable_data_ptr(), 1, N, d, tc);
-   
-    printf("done!\n");
+    hipEventRecord(stop);
+    float ms = 0;
+    hipEventElapsedTime(&ms, start, stop);
+    printf("%d iters of flash attention complete in %f ms!\n", n_iters, ms);
+
+    hipEventDestroy(start);
+    hipEventDestroy(stop);
 
 
 }
