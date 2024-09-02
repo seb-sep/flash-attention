@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 from torch.utils.cpp_extension import _import_module_from_library
 
-module = _import_module_from_library('m_v9', './build', True)
+module = _import_module_from_library('m_v4', './build', True)
 
 # instantiate tensors
 # dims = ((48, 32), (64, 256), (1024, 256), (4096, 1024))

@@ -211,19 +211,31 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     // }
     // load from should be however many vals left; if this happens to be >=N, nothing changes
     // otherwise, it loads the padded value
-    load_coalesced(&Q[qo_idx*d], Q_s, (N-qo_idx)*d, Br*d, H_ZERO);
-    load_coalesced((half*)nullptr, O_s, 0, Br*d, H_ZERO); // zero out shared
+    // load_coalesced(&Q[qo_idx*d], Q_s, (N-qo_idx)*d, Br*d, H_ZERO);
+    // load_coalesced((half*)nullptr, O_s, 0, Br*d, H_ZERO); // zero out shared
+    // try inlining and fusing coalesced loads
+    size_t size_from = min(Br, N-qo_idx)*d;
+    for (int i=0; i<d; ++i) {
+        // indices should line up perfectly between to and from, assume 
+        // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+        int idx = blockDim.x * i + threadIdx.x;
+        // maybe still faster to have all threads loading instead of turning off enough to get an even size?
+        // we know that we will never exceed the Br width here
+        Q_s[idx] = idx < size_from ? Q[qo_idx*d + idx] : H_ZERO;
+        O_s[idx] = H_ZERO;
+    }
+
+
+
     __syncthreads();
 
     // save the syncthreads for later
 
-    // if (threadIdx.x == 0 && blockIdx.x == 1) {
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
     //     printf("Q block %d:\n", blockIdx.x);
     //     tensorprint(Q_s, Br, d);
     //     printf("O:\n");
-        // tensorprint(O_s, Br, d);
-        // tensorprint(m_s, 1, Br);
-        // tensorprint(l_s, 1, Br);
+    //     tensorprint(O_s, Br, d);
     // }
 
     int r = blockDim.x / Bc;
@@ -235,11 +247,29 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         kv_idx = Bc * i;
 
         // load tile of k and v into sram
-        load_coalesced_transpose(&K[kv_idx*d], K_s, (N-kv_idx)*d, Bc*d, H_MIN, Bc, d);
-        load_coalesced(&V[kv_idx*d], V_s, (N-kv_idx)*d, Bc*d, H_ZERO);
+        // load_coalesced_transpose(&K[kv_idx*d], K_s, (N-kv_idx)*d, Bc*d, H_MIN, Bc, d);
+        // load_coalesced(&V[kv_idx*d], V_s, (N-kv_idx)*d, Bc*d, H_ZERO);
+        size_t size_to = Bc*d;
+        size_t size_from = min(Bc, N-kv_idx)*d;
+        int n_iters = size_to / blockDim.x + (size_to%blockDim.x != 0);
+        for (int k=0; k<n_iters; ++k) {
+            // indices should line up perfectly between to and from, assume 
+            // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+            int idx = blockDim.x * k + threadIdx.x;
+            // calculate indices for transposed load
+            int i = idx / d;
+            int j = idx % d;
+            int to_idx = Bc * j + i;
+            // maybe still faster to have all threads loading instead of turning off enough to get an even size?
+            if (idx < size_to) {
+                K_s[to_idx] = idx < size_from ? K[kv_idx*d + idx] : H_MIN;
+                V_s[idx] = idx < size_from ? V[kv_idx*d + idx] : H_ZERO;
+
+            }
+        }
         __syncthreads();
 
-        // if (threadIdx.x == 0 && blockIdx.x==1) {
+        // if (threadIdx.x == 0 && blockIdx.x==0) {
         //     printf("K^T block %d:\n", blockIdx.x);
         //     tensorprint(K_s, d, Bc);
         //     printf("V block %d:\n", blockIdx.x);
@@ -367,7 +397,19 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
     // }
     // qo_idx + Br < N, then Br, otherwise, N - qo-idx
-    load_coalesced(O_s, &O[qo_idx*d], Br*d, min(Br, N-qo_idx)*d, H_ZERO);
+    // load_coalesced(O_s, &O[qo_idx*d], Br*d, min(Br, N-qo_idx)*d, H_ZERO);
+    size_t size_to = min(Br, N-qo_idx)*d;
+    for (int i=0; i<d; ++i) {
+        // indices should line up perfectly between to and from, assume 
+        // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+        int idx = blockDim.x * i + threadIdx.x;
+        // maybe still faster to have all threads loading instead of turning off enough to get an even size?
+        // we know that we will never exceed the Br width here
+        if (idx < size_to)
+            O[qo_idx*d + idx] = O_s[idx];
+    }
+
+   
     __syncthreads();
 
 }
@@ -482,7 +524,7 @@ void benchmark_flash_attn(int N, int d, int n_iters=100) {
     hipEventSynchronize(stop);
     float ms = 0;
     hipEventElapsedTime(&ms, start, stop);
-    printf("%d iters of flash attention complete in %f ms!\n", n_iters, ms);
+    printf("%f ms\n", n_iters, ms);
 
     hipEventDestroy(start);
     hipEventDestroy(stop);
