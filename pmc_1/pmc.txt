@@ -1,0 +1,12 @@
+pmc: GPU_UTIL, MemUnitBusy
+pmc: KERNEL_DURATION
+pmc: KERNEL_DURATION
+pmc: KERNEL_DURATION
+pmc: GPUBusy, MemUnitBusy
+pmc: GPUBusy, MemUnitBusy
+pmc: L2CacheHit, WriteUnitStalled, GPU_UTIL
+pmc: Wavefronts, GRBM_GUI_ACTIVE
+pmc: L2CacheHit, MemUnitBusy, FETCH_SIZE, WriteUnitStalled, GL2C_HIT, ALUStalledByLDS, VALUInsts
+pmc: L2CacheHit, MemUnitBusy, FETCH_SIZE, WriteUnitStalled, ALUStalledByLDS, VALUInsts
+pmc: L2CacheHit, MemUnitBusy, WriteUnitStalled, GL2C_HIT, ALUStalledByLDS, VALUInsts
+pmc: L2CacheHit, MemUnitBusy, WriteUnitStalled, ALUStalledByLDS, VALUInsts

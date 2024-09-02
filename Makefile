@@ -15,8 +15,8 @@ time:
 	$(PYTHON) profiling/prof_flashattn.py
 
 profile-add:
-	rocprof --tool-version 1 --hip-trace -d $(PROF_FOLDER) $(PYTHON) profiling/vecadd.py
-	mv results.json results.copy_stats.csv results.db results.hip_stats.csv results.stats.csv results.sysinfo.txt $(PROF_FOLDER)
+	OUTPUT_FILE=$(PROF_FOLDER)/results.txt rocprofv2 --plugin file -i profiling/profile.txt -o foo $(PYTHON) profiling/prof_flashattn.py 
+	
 
 # run these on localhost only 
 map-prof-files: 
