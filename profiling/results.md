@@ -40,7 +40,7 @@ __commit 6e32cc297ed38518eb05bc5415c926992db2938d__
 3523.013916 ms
 
 ### Vectorized Memory Access (only Q and O)
-__commit 
+__commit 4828bac16b22c2001dcc04be898843ed51696607__
 3472.511475 ms
 3461.209229 ms
 3461.315674 ms
