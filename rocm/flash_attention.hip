@@ -154,8 +154,10 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     */ 
         
     const half H_ZERO = __float2half(0);
+    const half2 H2_ZERO = __float2half2_rn(0);
     // use largest negative instead of inf, because if you ever multiply -inf by 0 you're in big trouble
     const half H_MIN = __float2half(-65500.0f);
+    const half2 H2_MIN = __float2half2_rn(-65500.0f);
     
     // now that Bc and Br are statically known, can do statically allocated sram
     // dynamically allocate shared memory, because we don't know 
@@ -215,23 +217,34 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     // load_coalesced((half*)nullptr, O_s, 0, Br*d, H_ZERO); // zero out shared
     // try inlining and fusing coalesced loads
     size_t size_from = min(Br, N-qo_idx)*d;
-    for (int i=0; i<d; ++i) {
+    size_t size_to = Br*d;
+    // assume d always divisible by 2
+    for (int i=0; i<d/2; ++i) {
         // indices should line up perfectly between to and from, assume 
         // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+        // thread indices are doubled, since each loads in two at a time
         int idx = blockDim.x * i + threadIdx.x;
         // maybe still faster to have all threads loading instead of turning off enough to get an even size?
         // we know that we will never exceed the Br width here
-        Q_s[idx] = idx < size_from ? Q[qo_idx*d + idx] : H_ZERO;
-        O_s[idx] = H_ZERO;
+        // when we can load in both at a time
+        // there will only be this bad warp divergence in a single warp, so not too bad
+        if (idx*2+1 < size_from) {
+            reinterpret_cast<half2*>(Q_s)[idx] = reinterpret_cast<const half2*>(&Q[qo_idx*d])[idx];
+        } else if (idx*2 < size_from) {
+            // when using idx in the half2 vector, the pointer arithmetic is DOUBLED, so double here for parity
+            // I doubt that vectorizing this will provide much speedup, since shared is already pretty fast
+            Q_s[idx*2] = Q[qo_idx*d + idx*2];
+            Q_s[idx*2+1] = H_ZERO;
+        } else {
+            // printf("Loading zeros into shared indices %d and %d\n", idx*2, idx*2+1);
+            reinterpret_cast<half2*>(Q_s)[idx] = H2_ZERO;
+        }
+        reinterpret_cast<half2*>(O_s)[idx] = H2_ZERO;
     }
-
-
-
-    __syncthreads();
-
     // save the syncthreads for later
 
-    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    // __syncthreads();
+    // if (threadIdx.x == 0 && blockIdx.x == 1) {
     //     printf("Q block %d:\n", blockIdx.x);
     //     tensorprint(Q_s, Br, d);
     //     printf("O:\n");
@@ -241,6 +254,8 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     int r = blockDim.x / Bc;
     // loop over kv tiles
     int kv_idx;
+    // load vectorized to these regs, then place the values in shared
+    half k_temp[2];
     for (size_t i=0; i<tc; ++i) {
 
         // Index of the KV vector to start from
@@ -249,24 +264,44 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // load tile of k and v into sram
         // load_coalesced_transpose(&K[kv_idx*d], K_s, (N-kv_idx)*d, Bc*d, H_MIN, Bc, d);
         // load_coalesced(&V[kv_idx*d], V_s, (N-kv_idx)*d, Bc*d, H_ZERO);
-        size_t size_to = Bc*d;
-        size_t size_from = min(Bc, N-kv_idx)*d;
-        int n_iters = size_to / blockDim.x + (size_to%blockDim.x != 0);
+        size_to = Bc*d;
+        size_from = min(Bc, N-kv_idx)*d;
+        int n_iters = size_to / (blockDim.x*2) + (size_to%(blockDim.x*2) != 0);
+        // can't vectorize loads of K, since you need to place it transposed in shared...
+        // UNLESS you load vectorized to a register and then load to shared
         for (int k=0; k<n_iters; ++k) {
             // indices should line up perfectly between to and from, assume 
             // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+            // remember that the DOUBLED index into the matrix
             int idx = blockDim.x * k + threadIdx.x;
             // calculate indices for transposed load
-            int i = idx / d;
-            int j = idx % d;
+            int i = idx*2 / d;
+            int j = idx*2 % d;
             int to_idx = Bc * j + i;
-            // maybe still faster to have all threads loading instead of turning off enough to get an even size?
-            if (idx < size_to) {
-                K_s[to_idx] = idx < size_from ? K[kv_idx*d + idx] : H_MIN;
-                V_s[idx] = idx < size_from ? V[kv_idx*d + idx] : H_ZERO;
+            
+            if (idx*2+1 < size_from) {
+                reinterpret_cast<half2*>(V_s)[idx] = reinterpret_cast<const half2*>(&V[kv_idx*d])[idx];
+                
+                reinterpret_cast<half2*>(k_temp)[0] = reinterpret_cast<const half2*>(&K[kv_idx*d])[idx];
+                // printf("Loading %f %f to (%d %d), (%d %d)\n", __half2float(k_temp[0]), __half2float(k_temp[1]), j, i, j+1, i);
+                K_s[to_idx] = k_temp[0];
+                K_s[to_idx + Bc] = k_temp[1];
+            } else if (idx*2 < size_from) {
+                V_s[idx*2] = V[kv_idx*d + idx*2];
+                V_s[idx*2+1] = H_ZERO;
 
+                // printf("Loading %f zero to (%d %d), (%d %d) (linearized %d, %d)\n", __half2float(K[kv_idx*d + idx*2]), j, i, j+1, i, to_idx, to_idx+Bc);
+                K_s[to_idx] = K[kv_idx*d + idx*2];
+                K_s[to_idx + Bc] = H_MIN;
+            } else if (idx*2 < size_to) {
+                reinterpret_cast<half2*>(V_s)[idx] = H2_ZERO;
+                
+                // printf("Loading zeros to (%d %d), (%d %d) (linearized %d, %d)\n", j, i, j+1, i, to_idx, to_idx + Bc);
+                K_s[to_idx] = H_MIN;
+                K_s[to_idx + Bc] = H_MIN;
             }
         }
+        
         __syncthreads();
 
         // if (threadIdx.x == 0 && blockIdx.x==0) {
@@ -398,15 +433,19 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     // }
     // qo_idx + Br < N, then Br, otherwise, N - qo-idx
     // load_coalesced(O_s, &O[qo_idx*d], Br*d, min(Br, N-qo_idx)*d, H_ZERO);
-    size_t size_to = min(Br, N-qo_idx)*d;
-    for (int i=0; i<d; ++i) {
+    size_to = min(Br, N-qo_idx)*d;
+    size_from = Br*d;
+    for (int i=0; i<d/2; ++i) {
         // indices should line up perfectly between to and from, assume 
         // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
         int idx = blockDim.x * i + threadIdx.x;
         // maybe still faster to have all threads loading instead of turning off enough to get an even size?
         // we know that we will never exceed the Br width here
-        if (idx < size_to)
-            O[qo_idx*d + idx] = O_s[idx];
+        if (idx*2+1 < size_to) {
+            reinterpret_cast<half2*>(&O[qo_idx*d])[idx] = reinterpret_cast<half2*>(O_s)[idx];
+        } else if (idx*2 < size_to) {
+            O[qo_idx*d + idx*2] = O_s[idx*2];
+        }
     }
 
    
@@ -455,7 +494,7 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 
     // instantiate extra tensors
     auto options = torch::TensorOptions().device(Q.device()).dtype(Q.dtype()); 
-    torch::Tensor O = torch::zeros_like(Q);
+    torch::Tensor O = torch::empty_like(Q);
 
     // each thread block loads a SINGLE Q tile, iterates over all respective KV, so it only cares
     // abt size of Q tile, so use tr for num thread blocks
@@ -524,7 +563,7 @@ void benchmark_flash_attn(int N, int d, int n_iters=100) {
     hipEventSynchronize(stop);
     float ms = 0;
     hipEventElapsedTime(&ms, start, stop);
-    printf("%f ms\n", n_iters, ms);
+    printf("%f ms\n", ms);
 
     hipEventDestroy(start);
     hipEventDestroy(stop);

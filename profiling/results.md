@@ -14,6 +14,7 @@ __commit 232eba7d16e5ba85421525dc04ecda19f5ac8408__
 - 3924.164795 ms
 
 ### Fused and Inlined Memory Accesses
+__commit c76e85d8bbac9dd7db757bfc8b578e98373a8fc6__
 - 3471.194092 ms
 - 3472.105469 ms
 - 3472.462891 ms
