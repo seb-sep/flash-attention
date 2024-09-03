@@ -262,59 +262,58 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // load tile of k and v into sram
         // load_coalesced_transpose(&K[kv_idx*d], K_s, (N-kv_idx)*d, Bc*d, H_MIN, Bc, d);
         // load_coalesced(&V[kv_idx*d], V_s, (N-kv_idx)*d, Bc*d, H_ZERO);
-        size_to = Bc*d;
-        size_from = min(Bc, N-kv_idx)*d;
-        int n_iters = size_to / (blockDim.x*2) + (size_to%(blockDim.x*2) != 0);
-        // can't vectorize loads of K, since you need to place it transposed in shared...
-        // UNLESS you load vectorized to a register and then load to shared
-        for (int k=0; k<n_iters; ++k) {
-            // indices should line up perfectly between to and from, assume 
-            // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
-            // remember that the DOUBLED index into the matrix
-            int idx = blockDim.x * k + threadIdx.x;
-            // calculate indices for transposed load
-            int i = idx*2 / d;
-            int j = idx*2 % d;
-            int to_idx = Bc * j + i;
-            
-            if (idx*2+1 < size_from) {
-                reinterpret_cast<half2*>(V_s)[idx] = reinterpret_cast<const half2*>(&V[kv_idx*d])[idx];
-                
-                reinterpret_cast<half2*>(k_temp)[0] = reinterpret_cast<const half2*>(&K[kv_idx*d])[idx];
-                // printf("Loading %f %f to (%d %d), (%d %d)\n", __half2float(k_temp[0]), __half2float(k_temp[1]), j, i, j+1, i);
-                K_s[to_idx] = k_temp[0];
-                K_s[to_idx + Bc] = k_temp[1];
-            } else if (idx*2 < size_from) {
-                V_s[idx*2] = V[kv_idx*d + idx*2];
-                V_s[idx*2+1] = H_ZERO;
-
-                // printf("Loading %f zero to (%d %d), (%d %d) (linearized %d, %d)\n", __half2float(K[kv_idx*d + idx*2]), j, i, j+1, i, to_idx, to_idx+Bc);
-                K_s[to_idx] = K[kv_idx*d + idx*2];
-                K_s[to_idx + Bc] = H_MIN;
-            } else if (idx*2 < size_to) {
-                reinterpret_cast<half2*>(V_s)[idx] = H2_ZERO;
-                
-                // printf("Loading zeros to (%d %d), (%d %d) (linearized %d, %d)\n", j, i, j+1, i, to_idx, to_idx + Bc);
-                K_s[to_idx] = H_MIN;
-                K_s[to_idx + Bc] = H_MIN;
-            }
-        }
-        // int n_iters = size_to / blockDim.x + (size_to%blockDim.x != 0);
+        // size_to = Bc*d;
+        // size_from = min(Bc, N-kv_idx)*d;
+        // int n_iters = size_to / (blockDim.x*2) + (size_to%(blockDim.x*2) != 0);
+        // // can't vectorize loads of K, since you need to place it transposed in shared...
+        // // UNLESS you load vectorized to a register and then load to shared
         // for (int k=0; k<n_iters; ++k) {
         //     // indices should line up perfectly between to and from, assume 
         //     // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+        //     // remember that the DOUBLED index into the matrix
         //     int idx = blockDim.x * k + threadIdx.x;
         //     // calculate indices for transposed load
-        //     int i = idx / d;
-        //     int j = idx % d;
-        //     int to_idx = Bc * j + i;
-        //     // maybe still faster to have all threads loading instead of turning off enough to get an even size?
-        //     if (idx < size_to) {
-        //         K_s[to_idx] = idx < size_from ? K[kv_idx*d + idx] : H_MIN;
-        //         V_s[idx] = idx < size_from ? V[kv_idx*d + idx] : H_ZERO;
+        //     // int i = idx*2 / d;
+        //     // int j = idx*2 % d;
+        //     // int to_idx = Bc * j + i;
+            
+        //     if (idx*2+1 < size_from) {
+        //         reinterpret_cast<half2*>(V_s)[idx] = reinterpret_cast<const half2*>(&V[kv_idx*d])[idx];
+                
+        //         // reinterpret_cast<half2*>(k_temp)[0] = reinterpret_cast<const half2*>(&K[kv_idx*d])[idx];
+        //         // printf("Loading %f %f to (%d %d), (%d %d)\n", __half2float(k_temp[0]), __half2float(k_temp[1]), j, i, j+1, i);
+        //         // K_s[to_idx] = k_temp[0];
+        //         // K_s[to_idx + Bc] = k_temp[1];
+        //     } else if (idx*2 < size_from) {
+        //         V_s[idx*2] = V[kv_idx*d + idx*2];
+        //         V_s[idx*2+1] = H_ZERO;
 
+        //         // printf("Loading %f zero to (%d %d), (%d %d) (linearized %d, %d)\n", __half2float(K[kv_idx*d + idx*2]), j, i, j+1, i, to_idx, to_idx+Bc);
+        //         // K_s[to_idx] = K[kv_idx*d + idx*2];
+        //         // K_s[to_idx + Bc] = H_MIN;
+        //     } else if (idx*2 < size_to) {
+        //         reinterpret_cast<half2*>(V_s)[idx] = H2_ZERO;
+                
+        //         // printf("Loading zeros to (%d %d), (%d %d) (linearized %d, %d)\n", j, i, j+1, i, to_idx, to_idx + Bc);
+        //         // K_s[to_idx] = H_MIN;
+        //         // K_s[to_idx + Bc] = H_MIN;
         //     }
         // }
+        int n_iters = size_to / blockDim.x + (size_to%blockDim.x != 0);
+        for (int k=0; k<n_iters; ++k) {
+            // indices should line up perfectly between to and from, assume 
+            // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+            int idx = blockDim.x * k + threadIdx.x;
+            // calculate indices for transposed load
+            int i = idx / d;
+            int j = idx % d;
+            int to_idx = Bc * j + i;
+            // maybe still faster to have all threads loading instead of turning off enough to get an even size?
+            if (idx < size_to) {
+                K_s[to_idx] = idx < size_from ? K[kv_idx*d + idx] : H_MIN;
+                V_s[idx] = idx < size_from ? V[kv_idx*d + idx] : H_ZERO;
+            }
+        }
  
         
         __syncthreads();
