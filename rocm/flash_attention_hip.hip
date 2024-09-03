@@ -178,8 +178,6 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     half *P_s = O_s + qo_size;
 
 
-
-
     // half* m_s = P_s + p_size;
     // // should be br, because we need Br values of m and l in each shared block
     // half* l_s = m_s + Br;
@@ -301,6 +299,23 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
                 K_s[to_idx + Bc] = H_MIN;
             }
         }
+        // int n_iters = size_to / blockDim.x + (size_to%blockDim.x != 0);
+        // for (int k=0; k<n_iters; ++k) {
+        //     // indices should line up perfectly between to and from, assume 
+        //     // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
+        //     int idx = blockDim.x * k + threadIdx.x;
+        //     // calculate indices for transposed load
+        //     int i = idx / d;
+        //     int j = idx % d;
+        //     int to_idx = Bc * j + i;
+        //     // maybe still faster to have all threads loading instead of turning off enough to get an even size?
+        //     if (idx < size_to) {
+        //         K_s[to_idx] = idx < size_from ? K[kv_idx*d + idx] : H_MIN;
+        //         V_s[idx] = idx < size_from ? V[kv_idx*d + idx] : H_ZERO;
+
+        //     }
+        // }
+ 
         
         __syncthreads();
 
