@@ -1,6 +1,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+#include <rocwmma/rocwmma.hpp>
+
 #include <torch/types.h>
 #include <torch/extension.h>
 
@@ -8,9 +10,15 @@
 #include <iostream>
 #include <utility>
 
-/*
-BIG ISSUE: when the input Q has a O, and K has some -infs (because of padding), output is nan instead of -inf, which propagates down
-*/
+using rocwmma::row_major;
+using rocwmma::col_major;
+using rocwmma::matrix_a;
+using rocwmma::matrix_b;
+using rocwmma::accumulator;
+using rocwmma::float16_t;
+using rocwmma::float32_t;
+using rocwmma::float64_t;
+
 
 // in flash attn 2, set to either 64 or 128, can basically pick what you want as long as 
 // you have the sram for it
@@ -19,7 +27,6 @@ BIG ISSUE: when the input Q has a O, and K has some -infs (because of padding), 
 // sizes of QKV tiles are {64, 128} x {64, 128}
 // Is this referring to Br and Bc? Maybe this is kBlockM, N in the cuda code
 // https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/src/flash_fwd_kernel.h
-// FIXME: currently doesn't work when too many threads for the matmuls, figure out better allocation of threads
 // because of sram limitations, I can't afford the same block sizes and thus I should probably allocate less warps per block
 // Br should always be at least 32, since many parts of the kernel are row-wise over tiles of height Br
 // Furthermore, as long as things are threadwise over Br, Br should always be larger than Bc and generally as large as possible
@@ -28,7 +35,6 @@ const size_t Bc = 48;
 // const size_t Br = 8;
 // const size_t Bc = 4;
 const size_t N_WARPS = Br / 32 + (Br%32!=0);
-
 
 __device__
 void tensorprint(half* data, const size_t rows, const size_t cols) {
@@ -84,6 +90,121 @@ void shared_matmul(half* A, half* B, half* res, size_t m, size_t k, size_t n, bo
 
     __syncthreads();
 }
+
+// everything has to be 16x16
+// Remember that all matmuls you need to perform for flashattn have an M of Br, 
+// meaning you can map threads/warps to whole rows and j tile across them for your A
+// for b, j do the same thing but padded? kind of
+// each row of a needs a col of b with same num of tiles, but might be different num of rows and cols
+// ahhh: just tile a and b in 16x16 and then split those tiles across however many warps you got
+const int MMA_M = 16;
+const int MMA_K = 16;
+const int MMA_N = 16;
+
+__global__
+void wmma_matmul(const float16_t* a, const float16_t* b, float16_t* c, size_t m, size_t k, size_t n) {
+    // wmma fragments
+    auto fraga = rocwmma::fragment<matrix_a, MMA_M, MMA_N, MMA_K, float16_t, row_major>();
+    auto fragb = rocwmma::fragment<matrix_b, MMA_M, MMA_N, MMA_K, float16_t, col_major>();
+    auto fragc = rocwmma::fragment<accumulator, MMA_M, MMA_N, MMA_K, float16_t>();
+    auto fragacc = rocwmma::fragment<accumulator, MMA_M, MMA_N, MMA_K, float32_t>();
+
+    // Note that we're assuming the matrices are PERFECTLY TILED by 16x16 matrices, so the sizes
+    // of your shared memory better match as well!
+    size_t m_tiles = m / MMA_M;
+    size_t n_tiles = n / MMA_N;
+    size_t k_tiles = k / MMA_K;
+
+    size_t n_warps = blockDim.x / warpSize;
+    int warpId = threadIdx.x / warpSize;
+    
+    
+
+    // loop each warp over the m*n tiles of the matrix
+    // assume we don't know what shapes we'll get
+    for (int tile_idx=warpId; tile_idx<m_tiles*n_tiles; tile_idx+=n_warps) {
+        rocwmma::fill_fragment(fragacc, 0.0f);
+        // compute the ith output tile of the output matrix
+        int i = tile_idx / m_tiles;
+        int j = tile_idx % n_tiles;
+        // if (threadIdx.x == 0 && blockIdx.x == 0) {
+        //     printf("Warp %d computing tile %d of matrix, coords (%d, %d), will do %d loops\n", warpId, tile_idx, i, j, k_tiles);
+        // }
+        // iterate over ith row of a and jth col of b (both should be length k)
+        for (int k_idx=0; k_idx<k_tiles; ++k_idx) {
+            // if (threadIdx.x == 0 && blockIdx.x == 0) {
+            //     printf("Warp %d loading from idx %d of a and idx %d of b\n", warpId, (k*i*MMA_M + k_idx*MMA_N), (n*k_idx*MMA_M + j*MMA_N));
+            // }
+            rocwmma::load_matrix_sync(fraga, a + (k*i*MMA_M + k_idx*MMA_N), k);
+            rocwmma::load_matrix_sync(fragb, b + (n*k_idx*MMA_M + j*MMA_N), n);
+            rocwmma::synchronize_workgroup();
+
+            rocwmma::mma_sync(fragacc, fraga, fragb, fragacc);
+        }
+
+        for (int i=0; i<fragc.num_elements; ++i) 
+            fragc.x[i] = fragacc.x[i];
+
+        // store result
+        rocwmma::store_matrix_sync(c + (n*i*MMA_M + j*MMA_N), fragc, n, rocwmma::mem_row_major);
+
+    }
+}
+
+// B is in row-major format, but treat it LIKE a col-major matrix so it has the result of AB^T without
+// tranpsosing B first
+// This will allow for easy vectorizing loading of K exactly like V
+__global__
+void wmma_matmul_transp_b(const float16_t* a, const float16_t* b, float16_t* c, size_t m, size_t k, size_t n) {
+    // wmma fragments
+    auto fraga = rocwmma::fragment<matrix_a, MMA_M, MMA_N, MMA_K, float16_t, row_major>();
+    auto fragb = rocwmma::fragment<matrix_b, MMA_M, MMA_N, MMA_K, float16_t, col_major>();
+    auto fragc = rocwmma::fragment<accumulator, MMA_M, MMA_N, MMA_K, float16_t>();
+    auto fragacc = rocwmma::fragment<accumulator, MMA_M, MMA_N, MMA_K, float32_t>();
+
+    // Note that we're assuming the matrices are PERFECTLY TILED by 16x16 matrices, so the sizes
+    // of your shared memory better match as well!
+    size_t m_tiles = m / MMA_M;
+    size_t n_tiles = n / MMA_N;
+    size_t k_tiles = k / MMA_K;
+
+    size_t n_warps = blockDim.x / warpSize;
+    int warpId = threadIdx.x / warpSize;
+    
+    
+
+    // loop each warp over the m*n tiles of the matrix
+    // assume we don't know what shapes we'll get
+    for (int tile_idx=warpId; tile_idx<m_tiles*n_tiles; tile_idx+=n_warps) {
+        rocwmma::fill_fragment(fragacc, 0.0f);
+        // compute the ith output tile of the output matrix
+        int i = tile_idx / m_tiles;
+        int j = tile_idx % n_tiles;
+        // if (threadIdx.x == 0 && blockIdx.x == 0) {
+        //     printf("Warp %d computing tile %d of matrix, coords (%d, %d), will do %d loops\n", warpId, tile_idx, i, j, k_tiles);
+        // }
+        // iterate over ith row of a and jth col of b (both should be length k)
+        for (int k_idx=0; k_idx<k_tiles; ++k_idx) {
+            // if (threadIdx.x == 0 && blockIdx.x == 0) {
+            //     printf("Warp %d loading from idx %d of a and idx %d of b\n", warpId, (k*i*MMA_M + k_idx*MMA_N), (n*k_idx*MMA_M + j*MMA_N));
+            // }
+            rocwmma::load_matrix_sync(fraga, a + (k*i*MMA_M + k_idx*MMA_N), k);
+            rocwmma::load_matrix_sync(fragb, b + (k_idx*MMA_M + j*MMA_N*k), k);
+            rocwmma::synchronize_workgroup();
+
+            rocwmma::mma_sync(fragacc, fraga, fragb, fragacc);
+        }
+
+        for (int i=0; i<fragc.num_elements; ++i) 
+            fragc.x[i] = fragacc.x[i];
+
+        // store result
+        rocwmma::store_matrix_sync(c + (n*i*MMA_M + j*MMA_N), fragc, n, rocwmma::mem_row_major);
+
+    }
+}
+
+
 
 __device__ __forceinline__ 
 half max(half a, half b) { return __hgt(a, b) ? a : b; }
@@ -262,8 +383,8 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // load tile of k and v into sram
         // load_coalesced_transpose(&K[kv_idx*d], K_s, (N-kv_idx)*d, Bc*d, H_MIN, Bc, d);
         // load_coalesced(&V[kv_idx*d], V_s, (N-kv_idx)*d, Bc*d, H_ZERO);
-        // size_to = Bc*d;
-        // size_from = min(Bc, N-kv_idx)*d;
+        size_to = Bc*d;
+        size_from = min(Bc, N-kv_idx)*d;
         // int n_iters = size_to / (blockDim.x*2) + (size_to%(blockDim.x*2) != 0);
         // // can't vectorize loads of K, since you need to place it transposed in shared...
         // // UNLESS you load vectorized to a register and then load to shared
@@ -585,9 +706,23 @@ void benchmark_flash_attn(int N, int d, int n_iters=100) {
 
 }
 
+torch::Tensor matmul(torch::Tensor A, torch::Tensor B, bool b_t=false) {
+
+    int m = A.size(0);
+    int k = A.size(1);
+    int n = B.size(1);
+    
+    auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kHalf);
+    torch::Tensor C = torch::zeros({m, n}, options);
+    auto kernel = b_t ? wmma_matmul_transp_b : wmma_matmul;
+   hipLaunchKernelGGL(( kernel), dim3(1), dim3(64), 0, 0, (float16_t*)A.const_data_ptr(), (float16_t*)B.const_data_ptr(), (float16_t*)C.mutable_data_ptr(), m, k, n);
+    return C;
+}
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("flash_attn", torch::wrap_pybind_function(flash_attention), "flash_attn");
     m.def("run_bench", torch::wrap_pybind_function(benchmark_flash_attn), "get benchmark for flash attn");
+    m.def("matmul", torch::wrap_pybind_function(matmul), "matmul test on 16x16 float16");
 }
