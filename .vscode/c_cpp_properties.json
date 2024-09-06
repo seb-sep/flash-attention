@@ -8,6 +8,18 @@
                 "~/miniconda3/include/python3.12/**",
                 "/opt/rocm-6.1.3/include/**",
             ],
+            "defines": [
+                "__HIP_PLATFORM_AMD__",
+                "__AMD__"
+            ],
+            "browse": {
+                "path": [
+                    "${workspaceFolder}",
+                    "/opt/rocm-6.1.3/include"
+                ],
+                "limitSymbolsToIncludedHeaders": true,
+                "databaseFilename": "${workspaceFolder}/.vscode/browse.vc.db"
+            },
             "intelliSenseMode": "linux-gcc-x64",
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "c17",

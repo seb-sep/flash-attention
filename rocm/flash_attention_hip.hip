@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <iostream>
 #include <utility>
+#include <type_traits>
+
+
 
 using rocwmma::row_major;
 using rocwmma::col_major;
@@ -19,6 +22,8 @@ using rocwmma::float16_t;
 using rocwmma::float32_t;
 using rocwmma::float64_t;
 
+// only works for powers of 2
+#define ROUND_UP_TO(x, multiple) (((x) + ((multiple) - 1)) & ~((multiple) - 1))
 
 // in flash attn 2, set to either 64 or 128, can basically pick what you want as long as 
 // you have the sram for it
@@ -35,7 +40,6 @@ const size_t Bc = 48;
 // const size_t Br = 8;
 // const size_t Bc = 4;
 const size_t N_WARPS = Br / 32 + (Br%32!=0);
-
 __device__
 void tensorprint(half* data, const size_t rows, const size_t cols) {
     printf("[");
@@ -97,15 +101,18 @@ void shared_matmul(half* A, half* B, half* res, size_t m, size_t k, size_t n, bo
 // for b, j do the same thing but padded? kind of
 // each row of a needs a col of b with same num of tiles, but might be different num of rows and cols
 // ahhh: just tile a and b in 16x16 and then split those tiles across however many warps you got
+
 const int MMA_M = 16;
 const int MMA_K = 16;
 const int MMA_N = 16;
 
-__global__
+template <bool transpose_b, bool accum>
+__device__
 void wmma_matmul(const float16_t* a, const float16_t* b, float16_t* c, size_t m, size_t k, size_t n) {
     // wmma fragments
     auto fraga = rocwmma::fragment<matrix_a, MMA_M, MMA_N, MMA_K, float16_t, row_major>();
-    auto fragb = rocwmma::fragment<matrix_b, MMA_M, MMA_N, MMA_K, float16_t, col_major>();
+
+    auto fragb = rocwmma::fragment<matrix_b, MMA_M, MMA_N, MMA_K, float16_t>();
     auto fragc = rocwmma::fragment<accumulator, MMA_M, MMA_N, MMA_K, float16_t>();
     auto fragacc = rocwmma::fragment<accumulator, MMA_M, MMA_N, MMA_K, float32_t>();
 
@@ -118,90 +125,48 @@ void wmma_matmul(const float16_t* a, const float16_t* b, float16_t* c, size_t m,
     size_t n_warps = blockDim.x / warpSize;
     int warpId = threadIdx.x / warpSize;
     
-    
-
     // loop each warp over the m*n tiles of the matrix
     // assume we don't know what shapes we'll get
     for (int tile_idx=warpId; tile_idx<m_tiles*n_tiles; tile_idx+=n_warps) {
         rocwmma::fill_fragment(fragacc, 0.0f);
         // compute the ith output tile of the output matrix
-        int i = tile_idx / m_tiles;
+        int i = tile_idx / n_tiles;
         int j = tile_idx % n_tiles;
-        // if (threadIdx.x == 0 && blockIdx.x == 0) {
+        // if (threadIdx.x%32 == 0 && blockIdx.x == 0) {
         //     printf("Warp %d computing tile %d of matrix, coords (%d, %d), will do %d loops\n", warpId, tile_idx, i, j, k_tiles);
         // }
         // iterate over ith row of a and jth col of b (both should be length k)
         for (int k_idx=0; k_idx<k_tiles; ++k_idx) {
-            // if (threadIdx.x == 0 && blockIdx.x == 0) {
-            //     printf("Warp %d loading from idx %d of a and idx %d of b\n", warpId, (k*i*MMA_M + k_idx*MMA_N), (n*k_idx*MMA_M + j*MMA_N));
+            // B is in row-major format, but treat it LIKE a col-major matrix so it has the result of AB^T without
+            // tranpsosing B first
+            // This will allow for easy vectorizing loading of K exactly like V
+            int b_idx = transpose_b ? (k_idx*MMA_M + j*MMA_N*k) : (n*k_idx*MMA_M + j*MMA_N);
+            auto b_layout = transpose_b ? rocwmma::mem_col_major : rocwmma::mem_row_major;
+            // if (threadIdx.x%32 == 0 && blockIdx.x == 0) {
+            //     printf("Warp %d loading from idx %d of a and idx %d of b\n", warpId, (k*i*MMA_M + k_idx*MMA_N), b_idx);
             // }
             rocwmma::load_matrix_sync(fraga, a + (k*i*MMA_M + k_idx*MMA_N), k);
-            rocwmma::load_matrix_sync(fragb, b + (n*k_idx*MMA_M + j*MMA_N), n);
+            rocwmma::load_matrix_sync(fragb, b + b_idx, transpose_b ? k : n, b_layout);
             rocwmma::synchronize_workgroup();
 
             rocwmma::mma_sync(fragacc, fraga, fragb, fragacc);
         }
 
-        for (int i=0; i<fragc.num_elements; ++i) 
-            fragc.x[i] = fragacc.x[i];
-
-        // store result
-        rocwmma::store_matrix_sync(c + (n*i*MMA_M + j*MMA_N), fragc, n, rocwmma::mem_row_major);
-
-    }
-}
-
-// B is in row-major format, but treat it LIKE a col-major matrix so it has the result of AB^T without
-// tranpsosing B first
-// This will allow for easy vectorizing loading of K exactly like V
-__global__
-void wmma_matmul_transp_b(const float16_t* a, const float16_t* b, float16_t* c, size_t m, size_t k, size_t n) {
-    // wmma fragments
-    auto fraga = rocwmma::fragment<matrix_a, MMA_M, MMA_N, MMA_K, float16_t, row_major>();
-    auto fragb = rocwmma::fragment<matrix_b, MMA_M, MMA_N, MMA_K, float16_t, col_major>();
-    auto fragc = rocwmma::fragment<accumulator, MMA_M, MMA_N, MMA_K, float16_t>();
-    auto fragacc = rocwmma::fragment<accumulator, MMA_M, MMA_N, MMA_K, float32_t>();
-
-    // Note that we're assuming the matrices are PERFECTLY TILED by 16x16 matrices, so the sizes
-    // of your shared memory better match as well!
-    size_t m_tiles = m / MMA_M;
-    size_t n_tiles = n / MMA_N;
-    size_t k_tiles = k / MMA_K;
-
-    size_t n_warps = blockDim.x / warpSize;
-    int warpId = threadIdx.x / warpSize;
-    
-    
-
-    // loop each warp over the m*n tiles of the matrix
-    // assume we don't know what shapes we'll get
-    for (int tile_idx=warpId; tile_idx<m_tiles*n_tiles; tile_idx+=n_warps) {
-        rocwmma::fill_fragment(fragacc, 0.0f);
-        // compute the ith output tile of the output matrix
-        int i = tile_idx / m_tiles;
-        int j = tile_idx % n_tiles;
-        // if (threadIdx.x == 0 && blockIdx.x == 0) {
-        //     printf("Warp %d computing tile %d of matrix, coords (%d, %d), will do %d loops\n", warpId, tile_idx, i, j, k_tiles);
-        // }
-        // iterate over ith row of a and jth col of b (both should be length k)
-        for (int k_idx=0; k_idx<k_tiles; ++k_idx) {
-            // if (threadIdx.x == 0 && blockIdx.x == 0) {
-            //     printf("Warp %d loading from idx %d of a and idx %d of b\n", warpId, (k*i*MMA_M + k_idx*MMA_N), (n*k_idx*MMA_M + j*MMA_N));
-            // }
-            rocwmma::load_matrix_sync(fraga, a + (k*i*MMA_M + k_idx*MMA_N), k);
-            rocwmma::load_matrix_sync(fragb, b + (k_idx*MMA_M + j*MMA_N*k), k);
+        if constexpr (accum) {
+            rocwmma::load_matrix_sync(fragc, c + (n*i*MMA_M + j*MMA_N), n, rocwmma::mem_row_major);
             rocwmma::synchronize_workgroup();
-
-            rocwmma::mma_sync(fragacc, fraga, fragb, fragacc);
+            for (int i=0; i<fragc.num_elements; ++i) 
+                fragc.x[i] += fragacc.x[i];
+        } else {
+            for (int i=0; i<fragc.num_elements; ++i) 
+                fragc.x[i] = fragacc.x[i];
         }
 
-        for (int i=0; i<fragc.num_elements; ++i) 
-            fragc.x[i] = fragacc.x[i];
-
         // store result
         rocwmma::store_matrix_sync(c + (n*i*MMA_M + j*MMA_N), fragc, n, rocwmma::mem_row_major);
 
     }
+    rocwmma::synchronize_workgroup();
 }
 
 
@@ -251,6 +216,7 @@ __device__ __forceinline__ void load_coalesced_transpose(const T* from, T* to, c
 }
 
 
+
 __global__
 void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O, float scale, size_t N, size_t d, size_t tc) {
 
@@ -284,18 +250,21 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
     // dynamically allocate shared memory, because we don't know 
     // what our tile sizes will be until runtime (d is dynamic)
     extern __shared__ half sram[];
+    size_t Bc_padded = ROUND_UP_TO(Bc, 16);
+    size_t d_padded = ROUND_UP_TO(d, 16);
 
-    // // total size of shared k and v is num of vecs in tile * size of vec
-    size_t kv_size = Bc * d;
+    // total size of shared k and v is num of vecs in tile * size of vec
+    // pad for 16x16 tiles
+    size_t kv_size = Bc_padded * d_padded;
     half *K_s = sram;
     half *V_s = sram + kv_size;
 
-    size_t qo_size = Br * d;
+    size_t qo_size = Br * d_padded;
     half *Q_s = V_s + kv_size;
     half *O_s = Q_s + qo_size;
 
     // {Brxd} @ {dxBc} = {BrxBc}
-    size_t p_size = Br * Bc;
+    size_t p_size = Br * Bc_padded;
     half *P_s = O_s + qo_size;
 
 
@@ -315,144 +284,93 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
     // Index of the Q/O vector to start from
     int qo_idx = Br * blockIdx.x;
-    // if (threadIdx.x < Br) {
-    //     // index for a VECTOR of Q
-    //     if (idx < N) {
-    //         for (int k=0; k<d; ++k) {
-    //             // apply scaling factor here instead of after QK^T; this prevents matmul from overflowing
-    //             Q_s[threadIdx.x*d + k] = Q[idx*d + k];
-    //             O_s[threadIdx.x*d + k] = H_ZERO; //O[(j*Br + idx)*d + k];
-    //         }
-    //     } else {
-    //         for (int k=0; k<d; ++k) {
-    //             Q_s[threadIdx.x*d + k] = H_NINF;
-    //             O_s[threadIdx.x*d + k] = H_ZERO;
-    //         }
-    //     }
-    // }
-    // load from should be however many vals left; if this happens to be >=N, nothing changes
-    // otherwise, it loads the padded value
-    // load_coalesced(&Q[qo_idx*d], Q_s, (N-qo_idx)*d, Br*d, H_ZERO);
-    // load_coalesced((half*)nullptr, O_s, 0, Br*d, H_ZERO); // zero out shared
-    // try inlining and fusing coalesced loads
-    size_t size_from = min(Br, N-qo_idx)*d;
-    size_t size_to = Br*d;
+    size_t rows_from = min(Br, N-qo_idx);
     // assume d always divisible by 2
-    for (int i=0; i<d/2; ++i) {
-        // indices should line up perfectly between to and from, assume 
-        // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
-        // thread indices are doubled, since each loads in two at a time
-        int idx = blockDim.x * i + threadIdx.x;
-        // maybe still faster to have all threads loading instead of turning off enough to get an even size?
-        // we know that we will never exceed the Br width here
-        // when we can load in both at a time
-        // there will only be this bad warp divergence in a single warp, so not too bad
-        if (idx*2+1 < size_from) {
-            reinterpret_cast<half2*>(Q_s)[idx] = reinterpret_cast<const half2*>(&Q[qo_idx*d])[idx];
-        } else if (idx*2 < size_from) {
-            // when using idx in the half2 vector, the pointer arithmetic is DOUBLED, so double here for parity
-            // I doubt that vectorizing this will provide much speedup, since shared is already pretty fast
-            Q_s[idx*2] = Q[qo_idx*d + idx*2];
-            Q_s[idx*2+1] = H_ZERO;
+    // also need to pad with 0's; we know that Br is divisible by 32, so just need to ensure
+    // d is divisible by 16
+    for (int k=0; k<d_padded/2; ++k) {
+        // an index represents TWO floats, since each thread loads in two at a time; 
+        // so double idx when you use it
+        // these are indices FROM, not to; not for double floats 
+        int idx = (blockDim.x * k + threadIdx.x)*2;
+        int i = idx / d_padded;
+        int j = idx % d_padded; // d_padded is stride for Q and O (padded)
+
+        // padding value for tiled matmul
+        if (j >= d || i >= rows_from) {
+            reinterpret_cast<half2*>(Q_s)[idx/2] = H2_ZERO;
+        // there will only be this bad warp divergence in a single warp
+        } else if (j+1 < d) {
+            // if you're in one of the padding cols, just load zeros
+            reinterpret_cast<half2*>(Q_s)[idx/2] = reinterpret_cast<const half2*>(&Q[qo_idx*d])[i*d/2 + j/2];
         } else {
-            // printf("Loading zeros into shared indices %d and %d\n", idx*2, idx*2+1);
-            reinterpret_cast<half2*>(Q_s)[idx] = H2_ZERO;
-        }
-        reinterpret_cast<half2*>(O_s)[idx] = H2_ZERO;
+            // when using idx in the half2 vector, the pointer arithmetic is DOUBLED, so double here for parity
+            Q_s[i*d_padded + j] = Q[qo_idx*d + idx/2];
+            Q_s[i*d_padded + j+1] = H_ZERO;
+        } 
+        reinterpret_cast<half2*>(O_s)[idx/2] = H2_ZERO;
     }
     // save the syncthreads for later
 
     // __syncthreads();
-    // if (threadIdx.x == 0 && blockIdx.x == 1) {
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
     //     printf("Q block %d:\n", blockIdx.x);
-    //     tensorprint(Q_s, Br, d);
-    //     printf("O:\n");
-    //     tensorprint(O_s, Br, d);
+    //     tensorprint(Q_s, Br, d_padded);
+        // printf("O:\n");
+        // tensorprint(O_s, Br, d_padded);
     // }
 
     int r = blockDim.x / Bc;
     // loop over kv tiles
     int kv_idx;
     // load vectorized to these regs, then place the values in shared
-    half k_temp[2];
     for (size_t i=0; i<tc; ++i) {
 
         // Index of the KV vector to start from
         kv_idx = Bc * i;
 
         // load tile of k and v into sram
-        // load_coalesced_transpose(&K[kv_idx*d], K_s, (N-kv_idx)*d, Bc*d, H_MIN, Bc, d);
-        // load_coalesced(&V[kv_idx*d], V_s, (N-kv_idx)*d, Bc*d, H_ZERO);
-        size_to = Bc*d;
-        size_from = min(Bc, N-kv_idx)*d;
-        // int n_iters = size_to / (blockDim.x*2) + (size_to%(blockDim.x*2) != 0);
-        // // can't vectorize loads of K, since you need to place it transposed in shared...
-        // // UNLESS you load vectorized to a register and then load to shared
-        // for (int k=0; k<n_iters; ++k) {
-        //     // indices should line up perfectly between to and from, assume 
-        //     // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
-        //     // remember that the DOUBLED index into the matrix
-        //     int idx = blockDim.x * k + threadIdx.x;
-        //     // calculate indices for transposed load
-        //     // int i = idx*2 / d;
-        //     // int j = idx*2 % d;
-        //     // int to_idx = Bc * j + i;
-            
-        //     if (idx*2+1 < size_from) {
-        //         reinterpret_cast<half2*>(V_s)[idx] = reinterpret_cast<const half2*>(&V[kv_idx*d])[idx];
-                
-        //         // reinterpret_cast<half2*>(k_temp)[0] = reinterpret_cast<const half2*>(&K[kv_idx*d])[idx];
-        //         // printf("Loading %f %f to (%d %d), (%d %d)\n", __half2float(k_temp[0]), __half2float(k_temp[1]), j, i, j+1, i);
-        //         // K_s[to_idx] = k_temp[0];
-        //         // K_s[to_idx + Bc] = k_temp[1];
-        //     } else if (idx*2 < size_from) {
-        //         V_s[idx*2] = V[kv_idx*d + idx*2];
-        //         V_s[idx*2+1] = H_ZERO;
-
-        //         // printf("Loading %f zero to (%d %d), (%d %d) (linearized %d, %d)\n", __half2float(K[kv_idx*d + idx*2]), j, i, j+1, i, to_idx, to_idx+Bc);
-        //         // K_s[to_idx] = K[kv_idx*d + idx*2];
-        //         // K_s[to_idx + Bc] = H_MIN;
-        //     } else if (idx*2 < size_to) {
-        //         reinterpret_cast<half2*>(V_s)[idx] = H2_ZERO;
-                
-        //         // printf("Loading zeros to (%d %d), (%d %d) (linearized %d, %d)\n", j, i, j+1, i, to_idx, to_idx + Bc);
-        //         // K_s[to_idx] = H_MIN;
-        //         // K_s[to_idx + Bc] = H_MIN;
-        //     }
-        // }
-        int n_iters = size_to / blockDim.x + (size_to%blockDim.x != 0);
+        size_t size_to = Bc_padded*d_padded;
+        rows_from = min(Bc, N-kv_idx);
+        int n_iters = size_to / (blockDim.x*2) + (size_to%(blockDim.x*2) != 0);
+        // we can load K EXACTLY as we do V, because we just pretend it's col-major 
+        // for the WMMA
         for (int k=0; k<n_iters; ++k) {
             // indices should line up perfectly between to and from, assume 
             // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
-            int idx = blockDim.x * k + threadIdx.x;
-            // calculate indices for transposed load
-            int i = idx / d;
-            int j = idx % d;
-            int to_idx = Bc * j + i;
-            // maybe still faster to have all threads loading instead of turning off enough to get an even size?
-            if (idx < size_to) {
-                K_s[to_idx] = idx < size_from ? K[kv_idx*d + idx] : H_MIN;
-                V_s[idx] = idx < size_from ? V[kv_idx*d + idx] : H_ZERO;
+            // remember that the DOUBLED index into the matrix
+            int idx = (blockDim.x * k + threadIdx.x)*2;
+            int i = idx / d_padded;
+            int j = idx % d_padded;
+            
+            if (j >= d || i >= Bc) {
+                reinterpret_cast<half2*>(K_s)[idx/2] = H2_MIN;
+                reinterpret_cast<half2*>(V_s)[idx/2] = H2_ZERO;
+            } else if (j+1 < d) {
+                reinterpret_cast<half2*>(K_s)[idx/2] = (i<rows_from) ? reinterpret_cast<const half2*>(&K[kv_idx*d])[i*d/2 + j/2] : H2_MIN;
+                reinterpret_cast<half2*>(V_s)[idx/2] = (i<rows_from) ? reinterpret_cast<const half2*>(&V[kv_idx*d])[i*d/2 + j/2] : H2_ZERO;
+            } else {
+                K_s[i*d_padded + j] =  K[kv_idx*d + idx/2];
+                K_s[i*d_padded + j+1] = H_MIN;
+                V_s[i*d_padded + j] = V[kv_idx*d + idx/2];
+                V_s[i*d_padded + j+1] = H_ZERO;
             }
         }
- 
         
         __syncthreads();
 
         // if (threadIdx.x == 0 && blockIdx.x==0) {
-        //     printf("K^T block %d:\n", blockIdx.x);
-        //     tensorprint(K_s, d, Bc);
+        //     printf("K block %d:\n", blockIdx.x);
+        //     tensorprint(K_s, Bc_padded, d_padded);
         //     printf("V block %d:\n", blockIdx.x);
-        //     tensorprint(V_s, Bc, d);
+        //     tensorprint(V_s, Bc_padded, d_padded);
         // }
 
-        // // matmul QK^T
-        // if (threadIdx.x == 0 && blockIdx.x == 0)
-        //     printf("Performkng QKT");
-        shared_matmul(Q_s, K_s, P_s, Br, d, Bc, false);
-        // if (threadIdx.x == 0 && blockIdx.x == 2) {
+        // matmul QK^T
+        wmma_matmul<true, false>((float16_t*)Q_s, (float16_t*)K_s, (float16_t*)P_s, Br, d_padded, Bc_padded);
+        // if (threadIdx.x == 0 && blockIdx.x == 0) {
         //         printf("P_s before shifted exp:\n");
-        //         tensorprint(P_s, Br, Bc);
+        //         tensorprint(P_s, Br, Bc_padded);
         // }
 
         // define sumexp l_new to divide out at the end
@@ -464,16 +382,16 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // calculate max over a single row of P_s
         half mt_h = H_MIN;
         for (int i=0; i<Bc; ++i)
-            mt_h = max(mt_h, P_s[threadIdx.x*Bc + i]);
+            mt_h = max(mt_h, P_s[threadIdx.x*Bc_padded + i]);
         float mt = __half2float(mt_h);
         // shifted exponentiation of each row and row-wise sumexp
         float lt = 0;
         for (int i=0; i<Bc; ++i) {
-            float exp = __expf(__half2float(P_s[threadIdx.x*Bc + i]) - mt);
+            float exp = __expf(__half2float(P_s[threadIdx.x*Bc_padded + i]) - mt);
             P_s[threadIdx.x*Bc + i] = __float2half(exp);
             lt += exp;
         }
-        // if (threadIdx.x == 0 && blockIdx.x == 2) {
+        // if (threadIdx.x == 0 && blockIdx.x == 0) {
         //     printf("P_s after shifted exp:\n");
         //     tensorprint(P_s, Br, Bc);
         // }
@@ -499,7 +417,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         //     tensorprint(O_s, Br, d);
         // }
         for (int i=0; i<d; ++i)
-            O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], __float2half(old_lse));
+            O_s[threadIdx.x*d_padded + i] = __hmul(O_s[threadIdx.x*d_padded + i], __float2half(old_lse));
         
         // only necessary for now
         // __syncthreads();
@@ -511,7 +429,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // scale P's rows by exp(mt - m_new) as in flashattn
         // half undo_exp_h = __float2half(undo_exp);
         for (int i=0; i<Bc; ++i)
-            P_s[threadIdx.x*Bc+i] = __hmul(P_s[threadIdx.x*Bc+i], __float2half(undo_exp));
+            P_s[threadIdx.x*Bc_padded+i] = __hmul(P_s[threadIdx.x*Bc_padded+i], __float2half(undo_exp));
         
         // printf("multiplied by %f\n", __expf(mt - m_new));
         // load softmax statistics back to shared memory as the 'old' values
@@ -532,10 +450,10 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
         // if (threadIdx.x == 0 && blockIdx.x == 0)
         //     printf("Performkng PV");
-        shared_matmul(P_s, V_s, O_s, Br, Bc, d);
-        // if (threadIdx.x == 0 && blockIdx.x == 1) {
+        wmma_matmul<false, true>((float16_t*)P_s, (float16_t*)V_s, (float16_t*)O_s, Br, Bc_padded, d_padded);
+        // if (threadIdx.x == 0 && blockIdx.x == 0) {
         //     printf("Oi after the matmul:\n");
-        //     tensorprint(O_s, Br, d);
+        //     tensorprint(O_s, Br, d_padded);
         // }
 
         // divide new O by l_new
@@ -544,7 +462,7 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         //     printf("dividend is inf or nan, l_new is %f\n", l_new);
         // printf("l_new is %f, dividend is %f\n", l_new, dividend);
         for (int i=0; i<d; ++i)
-            O_s[threadIdx.x*d + i] = __hmul(O_s[threadIdx.x*d + i], dividend);
+            O_s[threadIdx.x*d_padded + i] = __hmul(O_s[threadIdx.x*d_padded + i], dividend);
             
         // if (threadIdx.x == 0 && blockIdx.x == 1) {
         //     printf("Oi after divided by l_new; end of block:\n");
@@ -556,30 +474,20 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
         // block iterates only over a single row of KV instead of the whole attn matrix
     }
 
-    // write tile of O back to global results
-    // a bunch of these will be garbage if from padded values
-    // if (threadIdx.x < Br && idx < N) {
-    //     for (int k=0; k<d; ++k) {
-    //         // printf("Writing %f back to dimension %d of output token %d\n", O_s[idx*d + k], k, idx);
-    //         O[idx*d + k] = O_s[threadIdx.x*d + k];
-    //     }
-    //     // don't worry about saving softmax statistics for now
-
-    // }
-    // qo_idx + Br < N, then Br, otherwise, N - qo-idx
-    // load_coalesced(O_s, &O[qo_idx*d], Br*d, min(Br, N-qo_idx)*d, H_ZERO);
-    size_to = min(Br, N-qo_idx)*d;
-    size_from = Br*d;
-    for (int i=0; i<d/2; ++i) {
+    // write tile of O back to global results, ONLY the actual values
+    size_t rows_to = min(Br, N-qo_idx);
+    for (int k=0; k<d/2; ++k) {
         // indices should line up perfectly between to and from, assume 
         // the pointers are to the starts of only what you want to copy (not the potential beginning of the matrix)
-        int idx = blockDim.x * i + threadIdx.x;
+        int idx = (blockDim.x * k + threadIdx.x)*2;
+        int i = idx / d_padded;
+        int j = idx % d_padded; 
         // maybe still faster to have all threads loading instead of turning off enough to get an even size?
         // we know that we will never exceed the Br width here
-        if (idx*2+1 < size_to) {
-            reinterpret_cast<half2*>(&O[qo_idx*d])[idx] = reinterpret_cast<half2*>(O_s)[idx];
-        } else if (idx*2 < size_to) {
-            O[qo_idx*d + idx*2] = O_s[idx*2];
+        if (j+1 < d) {
+            reinterpret_cast<half2*>(&O[qo_idx*d])[i*d/2 + j/2] = reinterpret_cast<half2*>(O_s)[idx/2];
+        } else if (j < d) {
+            O[qo_idx*d + idx/2] = O_s[i*d_padded + j];
         }
     }
 
@@ -588,19 +496,18 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
 }
 
-
 torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
 
     hipDeviceProp_t props;
     hipGetDeviceProperties(&props, 0);
 
-    std::cout << "  Shared Memory per Block: " << props.sharedMemPerBlock << std::endl;
-    std::cout << "  Shared Memory Banks: " << props.regsPerBlock << std::endl;
-    std::cout << "  Warp Size: " << props.warpSize << std::endl;
-    std::cout << "  Max Threads per Block: " << props.maxThreadsPerBlock << std::endl;
-    std::cout << "  Constant Memory: " << props.totalConstMem << std::endl;
-    std::cout << "  L2 Cache: " << props.l2CacheSize << std::endl;
-    std::cout << std::endl;
+    // std::cout << "  Shared Memory per Block: " << props.sharedMemPerBlock << std::endl;
+    // std::cout << "  Shared Memory Banks: " << props.regsPerBlock << std::endl;
+    // std::cout << "  Warp Size: " << props.warpSize << std::endl;
+    // std::cout << "  Max Threads per Block: " << props.maxThreadsPerBlock << std::endl;
+    // std::cout << "  Constant Memory: " << props.totalConstMem << std::endl;
+    // std::cout << "  L2 Cache: " << props.l2CacheSize << std::endl;
+    // std::cout << std::endl;
 
 
     if (!(Q.sizes() == K.sizes() && K.sizes() == V.sizes())) {
@@ -633,10 +540,15 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 
     // each thread block loads a SINGLE Q tile, iterates over all respective KV, so it only cares
     // abt size of Q tile, so use tr for num thread blocks
-    // how much sram to allocate?
-    size_t kv_size = Bc * d;
-    size_t qo_size = Br * d;
-    size_t p_size = Br * Bc;
+    // be sure to pad these s.t. you can tile to 16x16; 
+    // both dims must be padded to mul of 16, but size just needs to be mul of 256
+
+    size_t Bc_padded = ROUND_UP_TO(Bc, 16);
+    size_t d_padded = ROUND_UP_TO(d, 16);
+
+    size_t kv_size = Bc_padded * d_padded;
+    size_t qo_size = Br * d_padded;
+    size_t p_size = Br * Bc_padded;
     // shared for K, V, Q, O, m, l
     // don't allocate shared for m and l now
     size_t smem_size = sizeof(half) * (2*kv_size + 2*qo_size + p_size);
@@ -706,16 +618,26 @@ void benchmark_flash_attn(int N, int d, int n_iters=100) {
 
 }
 
-torch::Tensor matmul(torch::Tensor A, torch::Tensor B, bool b_t=false) {
+__global__ void matmul_kernel(const float16_t* A, const float16_t* B, float16_t* C, 
+                            size_t m, size_t k, size_t n, bool b_t) { 
+    if (b_t) {
+        wmma_matmul<true, false>(A, B, C, m, k, n);
+    } else {
+        wmma_matmul<false, false>(A, B, C, m, k, n);
+    }
+}
+
+torch::Tensor matmul(torch::Tensor A, torch::Tensor B, bool b_t) {
 
     int m = A.size(0);
     int k = A.size(1);
-    int n = B.size(1);
-    
+    int n = b_t ? B.size(0) : B.size(1);
+
     auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kHalf);
     torch::Tensor C = torch::zeros({m, n}, options);
-    auto kernel = b_t ? wmma_matmul_transp_b : wmma_matmul;
-   hipLaunchKernelGGL(( kernel), dim3(1), dim3(64), 0, 0, (float16_t*)A.const_data_ptr(), (float16_t*)B.const_data_ptr(), (float16_t*)C.mutable_data_ptr(), m, k, n);
+   hipLaunchKernelGGL(( matmul_kernel), dim3(1), dim3(32), 0, 0, 
+        (float16_t*)A.const_data_ptr(), (float16_t*)B.const_data_ptr(), 
+        (float16_t*)C.mutable_data_ptr(), m, k, n, b_t);
     return C;
 }
 

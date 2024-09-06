@@ -14,6 +14,20 @@
         "numeric": "cpp",
         "semaphore": "cpp",
         "valarray": "cpp",
-        "__undef_macros": "cpp"
-    }
+        "__undef_macros": "cpp",
+        "iostream": "cpp"
+    },
+    "makefile.configureOnOpen": false,
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/**",
+        "/opt/rocm-6.1.3/include/**"
+    ],
+    "C_Cpp.default.compilerPath": "/opt/rocm-6.1.3/bin/hipcc",
+    "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+    "C_Cpp.default.defines": [
+        "__HIP_PLATFORM_AMD__",
+        "__AMD__"
+    ],
+    "C_Cpp.default.cppStandard": "c++17",
+    "editor.suggest.showKeywords": true,
 }
