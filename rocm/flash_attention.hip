@@ -12,7 +12,6 @@
 #include <type_traits>
 
 
-
 using rocwmma::row_major;
 using rocwmma::col_major;
 using rocwmma::matrix_a;
@@ -22,6 +21,7 @@ using rocwmma::float16_t;
 using rocwmma::float32_t;
 using rocwmma::float64_t;
 
+// #define DEBUG
 // only works for powers of 2
 #define ROUND_UP_TO(x, multiple) (((x) + ((multiple) - 1)) & ~((multiple) - 1))
 
@@ -39,7 +39,8 @@ const size_t Br = 32;
 const size_t Bc = 48;
 // const size_t Br = 8;
 // const size_t Bc = 4;
-const size_t N_WARPS = Br / 32 + (Br%32!=0);
+// Br always multiple of 32
+const size_t N_WARPS = Br / 32;
 __device__
 void tensorprint(half* data, const size_t rows, const size_t cols) {
     printf("[");
@@ -498,16 +499,17 @@ void flash_attention_kernel(const half *Q, const half* K, const half* V, half* O
 
 torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
 
+    #ifdef DEBUG
     hipDeviceProp_t props;
     hipGetDeviceProperties(&props, 0);
 
-    // std::cout << "  Shared Memory per Block: " << props.sharedMemPerBlock << std::endl;
-    // std::cout << "  Shared Memory Banks: " << props.regsPerBlock << std::endl;
-    // std::cout << "  Warp Size: " << props.warpSize << std::endl;
-    // std::cout << "  Max Threads per Block: " << props.maxThreadsPerBlock << std::endl;
-    // std::cout << "  Constant Memory: " << props.totalConstMem << std::endl;
-    // std::cout << "  L2 Cache: " << props.l2CacheSize << std::endl;
-    // std::cout << std::endl;
+    std::cout << "  Shared Memory per Block: " << props.sharedMemPerBlock << std::endl;
+    std::cout << "  Shared Memory Banks: " << props.regsPerBlock << std::endl;
+    std::cout << "  Warp Size: " << props.warpSize << std::endl;
+    std::cout << "  Max Threads per Block: " << props.maxThreadsPerBlock << std::endl;
+    std::cout << "  Constant Memory: " << props.totalConstMem << std::endl;
+    std::cout << "  L2 Cache: " << props.l2CacheSize << std::endl;
+    std::cout << std::endl;
 
 
     if (!(Q.sizes() == K.sizes() && K.sizes() == V.sizes())) {
@@ -519,7 +521,7 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
         printf("kernel implemented in fp16 only\n");
         return Q;
     } 
-
+    #endif
     
     size_t N = Q.size(0);
     size_t d = Q.size(1);
@@ -532,7 +534,10 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
 
     // // size and num of Q, O tiles
     size_t tr = N / Br + (N%Br!=0);
+
+    #ifdef DEBUG
     printf("tc=%d, tr=%d\n", tc, tr);
+    #endif
 
     // instantiate extra tensors
     auto options = torch::TensorOptions().device(Q.device()).dtype(Q.dtype()); 
@@ -553,24 +558,25 @@ torch::Tensor flash_attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V)
     // don't allocate shared for m and l now
     size_t smem_size = sizeof(half) * (2*kv_size + 2*qo_size + p_size);
 
-    float scaling_factor = (1 / sqrt(d));
-    // std::cout << "scaling QK^T by " << (scaling_factor) << "\n";
+    // std::cout << "Launching kernel with smem size " << smem_size << "\n";
 
-    std::cout << "Launching kernel with smem size " << smem_size << "\n";
-
+    #ifdef DEBUG
     if (smem_size > props.sharedMemPerBlock) {
         printf("Too much shared memory requested per block\n");
     } else {
+    #endif
         // want flat thread grid
         flash_attention_kernel<<<tr, 32*N_WARPS, smem_size>>>(
             (half*)Q.const_data_ptr(), (half*)K.const_data_ptr(), (half*)V.const_data_ptr(), 
             (half*)O.mutable_data_ptr(), 1, N, d, tc);
 
+    #ifdef DEBUG
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
             printf("Error running kernel: %s\n", hipGetErrorString(err));
         }
     }
+    #endif
 
     
     return O;

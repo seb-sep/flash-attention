@@ -14,6 +14,9 @@ profile:
 time:
 	$(PYTHON) profiling/prof_flashattn.py
 
+pytorch-test:
+	$(PYTHON) profiling/pytorch_profile.py
+
 profile-add:
 	OUTPUT_FILE=$(PROF_FOLDER)/results.txt rocprofv2 --plugin file -i profiling/profile.txt -o foo $(PYTHON) profiling/prof_flashattn.py 
 	

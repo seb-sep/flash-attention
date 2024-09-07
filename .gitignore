@@ -1,3 +1,5 @@
 /profiling/prof_results/*
-
+*.db
+*.db-shm
+*.db-wal
 /build
