@@ -5,7 +5,7 @@ from torch.nn.functional import scaled_dot_product_attention
 
 # Instantiate custon and naive flash attn
 print("Loading custom FlashAttention:")
-my_flashattn = _import_module_from_library('m_v2', './build', True).flash_attn
+my_flashattn = _import_module_from_library('m', './build', True).flash_attn
 
 pytorch_attn = scaled_dot_product_attention
 
@@ -53,6 +53,6 @@ def run_flash_attention_comparison(N, d, num_iterations):
     print("Timing for builtin PyTorch attention:")
     print(pytorch_timer.timeit(num_iterations))
 
-N, d = 32768, 128
-num_iterations = 10  
+N, d = 16384, 128
+num_iterations = 10
 run_flash_attention_comparison(N, d, num_iterations)

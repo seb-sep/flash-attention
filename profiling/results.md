@@ -77,3 +77,6 @@ __commit dbc1cc34a300e60f9d3b4c3543e1667471bcaf36__
 547.765015 ms
 547.028809 ms
 546.822510 ms
+
+### Optimized block sizes
+180.186429 ms
